@@ -1,0 +1,9 @@
+/target
+# Generated test PKI and content — never commit private keys.
+/certs/
+/served/
+*.key
+*.crt
+*.csr
+*.srl
+*.p12

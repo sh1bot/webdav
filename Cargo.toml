@@ -1,0 +1,19 @@
+[package]
+name = "tiny-webdav"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny, single-threaded, read-only WebDAV server over TLS with client-certificate (mTLS) authentication"
+license = "MIT"
+
+[[bin]]
+name = "tiny-webdav"
+path = "src/main.rs"
+
+[dependencies]
+# TLS, using the well-tested `ring` crypto provider so we don't need a C/C++
+# build of aws-lc. `ring` still needs a C toolchain but is lightweight.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+
+[profile.release]
+opt-level = 2
