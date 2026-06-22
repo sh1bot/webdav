@@ -18,8 +18,10 @@ authentication.
   - `PROPFIND` (`Depth: 0` and `Depth: 1`) returning `207 Multi-Status`
 - HTTP `Range` requests (single `bytes=` ranges) for partial/resumable
   downloads: responds `206 Partial Content` with `Content-Range`, `416` for
-  unsatisfiable ranges, and advertises `Accept-Ranges: bytes`. Ranges are
-  served by seeking, so a slice never loads the whole file into memory.
+  unsatisfiable ranges, and advertises `Accept-Ranges: bytes`.
+- File bodies are streamed in 64 KiB chunks (seeking for ranges), so even
+  multi-gigabyte files are served with near-constant memory — the whole file
+  is never read into RAM.
 - Every mutating method (`PUT`, `DELETE`, `MKCOL`, `MOVE`, `COPY`,
   `PROPPATCH`, `LOCK`, …) is rejected with `405 Method Not Allowed`.
 - Requires a valid client certificate for every connection.

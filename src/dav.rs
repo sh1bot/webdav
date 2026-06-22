@@ -93,53 +93,59 @@ fn get_or_head<S: Write>(
     match req.header("range").map(|r| parse_byte_range(r, len)) {
         // A range was requested and it is satisfiable: 206 Partial Content.
         Some(RangeSpec::Satisfiable { start, end }) => {
-            let data = match read_slice(fs_path, start, end) {
-                Ok(d) => d,
-                Err(_) => return http::write_status(stream, 404, "Not Found"),
-            };
-            headers.push((
-                "Content-Range",
-                format!("bytes {}-{}/{}", start, end, len),
-            ));
-            http::write_response(
-                stream,
-                206,
-                "Partial Content",
-                content_type,
-                &headers,
-                &data,
-                send_body,
-            )
+            let count = end - start + 1;
+            headers.push(("Content-Range", format!("bytes {}-{}/{}", start, end, len)));
+            stream_file(stream, fs_path, start, count, 206, "Partial Content", content_type, &headers, send_body)
         }
         // A range was requested but cannot be satisfied: 416.
-        Some(RangeSpec::Unsatisfiable) => {
-            http::write_response(
-                stream,
-                416,
-                "Range Not Satisfiable",
-                "text/plain; charset=utf-8",
-                &[("Content-Range", format!("bytes */{}", len))],
-                b"416 Range Not Satisfiable\n",
-                true,
-            )
-        }
+        Some(RangeSpec::Unsatisfiable) => http::write_response(
+            stream,
+            416,
+            "Range Not Satisfiable",
+            "text/plain; charset=utf-8",
+            &[("Content-Range", format!("bytes */{}", len))],
+            b"416 Range Not Satisfiable\n",
+            true,
+        ),
         // No usable Range header: serve the whole file (200).
-        _ => {
-            let data = match fs::read(fs_path) {
-                Ok(d) => d,
-                Err(_) => return http::write_status(stream, 404, "Not Found"),
-            };
-            http::write_response(
-                stream,
-                200,
-                "OK",
-                content_type,
-                &headers,
-                &data,
-                send_body,
-            )
-        }
+        _ => stream_file(stream, fs_path, 0, len, 200, "OK", content_type, &headers, send_body),
     }
+}
+
+/// Stream `count` bytes of a file starting at byte `offset` as the response
+/// body, after writing the status line and headers. The file is read in
+/// chunks (see [`http::stream_body`]) so large files never sit in memory.
+#[allow(clippy::too_many_arguments)]
+fn stream_file<S: Write>(
+    stream: &mut S,
+    fs_path: &Path,
+    offset: u64,
+    count: u64,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    headers: &[(&str, String)],
+    send_body: bool,
+) -> io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+
+    // Open (and seek) before writing the header so a failure can still be
+    // reported as an error response rather than a truncated body.
+    let mut file = match fs::File::open(fs_path) {
+        Ok(f) => f,
+        Err(_) => return http::write_status(stream, 404, "Not Found"),
+    };
+    if offset != 0 && file.seek(SeekFrom::Start(offset)).is_err() {
+        return http::write_status(stream, 500, "Internal Server Error");
+    }
+
+    http::write_head(stream, status, reason, content_type, headers, count)?;
+    if send_body {
+        http::stream_body(&mut file, stream, count)?;
+    } else {
+        stream.flush()?;
+    }
+    Ok(())
 }
 
 /// The outcome of interpreting a `Range` header against a known content length.
@@ -216,18 +222,6 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
         return RangeSpec::Unsatisfiable;
     }
     RangeSpec::Satisfiable { start, end }
-}
-
-/// Read the inclusive byte range `[start, end]` from a file by seeking,
-/// so we never load the whole file just to serve a slice.
-fn read_slice(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut f = fs::File::open(path)?;
-    f.seek(SeekFrom::Start(start))?;
-    let count = (end - start + 1) as usize;
-    let mut buf = vec![0u8; count];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 fn directory_index_html(decoded_path: &str, fs_path: &Path) -> String {

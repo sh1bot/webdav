@@ -112,9 +112,28 @@ pub fn write_response<S: Write>(
     body: &[u8],
     send_body: bool,
 ) -> io::Result<()> {
+    write_head(stream, status, reason, content_type, extra_headers, body.len() as u64)?;
+    if send_body {
+        stream.write_all(body)?;
+    }
+    stream.flush()
+}
+
+/// Write just the status line and headers, declaring `content_length` but
+/// emitting no body. Callers stream the body themselves afterwards (see
+/// [`stream_body`]) — this lets us serve arbitrarily large files without ever
+/// holding them in memory.
+pub fn write_head<S: Write>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    extra_headers: &[(&str, String)],
+    content_length: u64,
+) -> io::Result<()> {
     let mut head = String::new();
     head.push_str(&format!("HTTP/1.1 {} {}\r\n", status, reason));
-    head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    head.push_str(&format!("Content-Length: {}\r\n", content_length));
     if !content_type.is_empty() {
         head.push_str(&format!("Content-Type: {}\r\n", content_type));
     }
@@ -124,12 +143,27 @@ pub fn write_response<S: Write>(
     head.push_str("Server: tiny-webdav\r\n");
     head.push_str("Connection: close\r\n");
     head.push_str("\r\n");
+    stream.write_all(head.as_bytes())
+}
 
-    stream.write_all(head.as_bytes())?;
-    if send_body {
-        stream.write_all(body)?;
+/// Copy exactly `len` bytes from `reader` to `writer` in fixed-size chunks,
+/// then flush. Used to stream file bodies after [`write_head`].
+pub fn stream_body<R: Read, W: Write>(reader: &mut R, writer: &mut W, len: u64) -> io::Result<()> {
+    const CHUNK: usize = 64 * 1024;
+    let mut buf = vec![0u8; CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(CHUNK as u64) as usize;
+        let n = reader.read(&mut buf[..want])?;
+        if n == 0 {
+            // File ended sooner than its declared length (e.g. truncated
+            // concurrently). Stop; the Connection: close framing bounds it.
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        remaining -= n as u64;
     }
-    stream.flush()
+    writer.flush()
 }
 
 /// Convenience for short text/error responses.
