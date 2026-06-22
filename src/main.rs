@@ -29,7 +29,8 @@ struct Args {
     root: PathBuf,
     cert: PathBuf,
     key: PathBuf,
-    client_ca: PathBuf,
+    client_ca: Option<PathBuf>,
+    client_cert_optional: bool,
     auth_file: Option<PathBuf>,
     user: Option<String>,
     password: Option<String>,
@@ -38,21 +39,25 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "tiny-webdav — read-only WebDAV over TLS with client-certificate auth\n\n\
+        "tiny-webdav — read-only WebDAV over TLS\n\n\
          USAGE:\n  \
-           tiny-webdav --cert <server.crt> --key <server.key> --client-ca <ca.crt> \\\n             \
-                       [--root <dir>] [--addr <host:port>]\n\n\
+           tiny-webdav --cert <server.crt> --key <server.key> \\\n             \
+                       [--client-ca <ca.crt>] [--root <dir>] [--addr <host:port>]\n\n\
          OPTIONS:\n  \
-           --cert       PEM server certificate (chain) presented to clients\n  \
-           --key        PEM server private key\n  \
-           --client-ca  PEM CA certificate used to verify client certificates\n  \
-           --root       Directory to serve (default: current directory)\n  \
-           --addr       Listen address (default: 127.0.0.1:4443)\n\n  \
-           Optional HTTP Basic auth (layered on top of the client cert):\n  \
-           --auth-file  File of 'username:password' lines (# comments allowed)\n  \
-           --user       A single username (use with --password)\n  \
-           --password   Password for --user\n  \
-           --realm      Basic-auth realm shown to clients (default: tiny-webdav)\n"
+           --cert                  PEM server certificate (chain) presented to clients\n  \
+           --key                   PEM server private key\n  \
+           --root                  Directory to serve (default: current directory)\n  \
+           --addr                  Listen address (default: 127.0.0.1:4443)\n\n  \
+           Client-certificate auth (mTLS):\n  \
+           --client-ca <ca.crt>    Verify client certs against this CA. Omit to\n                          \
+                       disable client-cert auth entirely.\n  \
+           --client-cert-optional  Accept clients without a cert; still verify any\n                          \
+                       cert that *is* presented (requires --client-ca).\n\n  \
+           HTTP Basic auth (layered on top of any client-cert auth):\n  \
+           --auth-file <file>      File of 'username:password' lines (# comments)\n  \
+           --user <name>           A single username (use with --password)\n  \
+           --password <pass>       Password for --user\n  \
+           --realm <realm>         Basic-auth realm shown to clients (default: tiny-webdav)\n"
     );
     process::exit(2);
 }
@@ -63,6 +68,7 @@ fn parse_args() -> Args {
     let mut cert: Option<PathBuf> = None;
     let mut key: Option<PathBuf> = None;
     let mut client_ca: Option<PathBuf> = None;
+    let mut client_cert_optional = false;
     let mut auth_file: Option<PathBuf> = None;
     let mut user: Option<String> = None;
     let mut password: Option<String> = None;
@@ -76,6 +82,7 @@ fn parse_args() -> Args {
             "--cert" => cert = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--key" => key = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--client-ca" => client_ca = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--client-cert-optional" => client_cert_optional = true,
             "--auth-file" => auth_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--user" => user = Some(it.next().unwrap_or_else(|| usage())),
             "--password" => password = Some(it.next().unwrap_or_else(|| usage())),
@@ -93,20 +100,26 @@ fn parse_args() -> Args {
         usage();
     }
 
-    match (cert, key, client_ca) {
-        (Some(cert), Some(key), Some(client_ca)) => Args {
+    if client_cert_optional && client_ca.is_none() {
+        eprintln!("error: --client-cert-optional requires --client-ca\n");
+        usage();
+    }
+
+    match (cert, key) {
+        (Some(cert), Some(key)) => Args {
             addr,
             root,
             cert,
             key,
             client_ca,
+            client_cert_optional,
             auth_file,
             user,
             password,
             realm,
         },
         _ => {
-            eprintln!("error: --cert, --key and --client-ca are all required\n");
+            eprintln!("error: --cert and --key are required\n");
             usage();
         }
     }
@@ -149,24 +162,33 @@ fn build_tls_config(args: &Args) -> io::Result<ServerConfig> {
     let server_certs = load_certs(&args.cert)?;
     let server_key = load_key(&args.key)?;
 
-    // Trust anchors used to verify *client* certificates.
-    let mut roots = RootCertStore::empty();
-    for ca in load_certs(&args.client_ca)? {
-        roots
-            .add(ca)
+    let to_invalid = |e: rustls::Error| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
+
+    let builder = ServerConfig::builder();
+    let with_certs = match &args.client_ca {
+        // No client CA configured: don't request client certificates at all.
+        None => builder.with_no_client_auth(),
+        Some(ca_path) => {
+            // Trust anchors used to verify *client* certificates.
+            let mut roots = RootCertStore::empty();
+            for ca in load_certs(ca_path)? {
+                roots.add(ca).map_err(to_invalid)?;
+            }
+            let vb = WebPkiClientVerifier::builder(Arc::new(roots));
+            // `--client-cert-optional` lets clients connect without a cert,
+            // while still verifying any cert that *is* presented. Otherwise a
+            // valid client certificate is mandatory.
+            let verifier = if args.client_cert_optional {
+                vb.allow_unauthenticated().build()
+            } else {
+                vb.build()
+            }
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    }
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
 
-    // Mandatory client-certificate verification: the handshake fails for any
-    // client that doesn't present a certificate signed by our CA.
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(server_certs, server_key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    with_certs.with_single_cert(server_certs, server_key).map_err(to_invalid)
 }
 
 fn serve_connection(
@@ -242,9 +264,16 @@ fn main() {
         }
     };
 
+    let cert_required = args.client_ca.is_some() && !args.client_cert_optional;
+    let cert_mode = match (&args.client_ca, args.client_cert_optional) {
+        (None, _) => "disabled",
+        (Some(_), false) => "REQUIRED",
+        (Some(_), true) => "optional",
+    };
+
     println!("tiny-webdav listening on https://{}", args.addr);
     println!("serving (read-only): {}", canonical_root.display());
-    println!("client-certificate authentication: REQUIRED");
+    println!("client-certificate authentication: {}", cert_mode);
     if auth.is_enabled() {
         println!(
             "HTTP Basic authentication: REQUIRED ({} user(s), realm \"{}\")",
@@ -253,6 +282,12 @@ fn main() {
         );
     } else {
         println!("HTTP Basic authentication: disabled");
+    }
+    if !cert_required && !auth.is_enabled() {
+        println!(
+            "WARNING: no client-cert requirement and no password — \
+             anyone who can reach this port can read the served files."
+        );
     }
 
     // Single-threaded: handle one connection fully, then move to the next.

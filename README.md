@@ -3,16 +3,20 @@
 A very small, **single-threaded, read-only** WebDAV server written in Rust, with
 **TLS client-certificate authentication** (mutual TLS).
 
-The primary authentication is "private key sign-in": each client holds a private
-key + certificate signed by a CA the server trusts, and the TLS handshake itself
-proves the client possesses that private key. This is a native feature of
-TLS/HTTPS — usually called **mutual TLS (mTLS)** or client-certificate
-authentication.
+Two independent authentication layers are available, and you can use either or
+both:
 
-Optionally, you can also require **HTTP Basic username/password** on top of the
-client certificate. When configured, a request must satisfy **both** the client
-certificate **and** valid credentials. Basic auth is safe here because the whole
-connection is already encrypted by TLS.
+1. **Client certificate ("private key sign-in" / mutual TLS).** Each client
+   holds a private key + certificate signed by a CA the server trusts, and the
+   TLS handshake itself proves the client possesses that private key. This is a
+   native feature of TLS/HTTPS. It can be **required**, **optional** (verify a
+   cert if presented, but also accept clients without one), or **disabled**.
+2. **HTTP Basic username/password.** Safe here because the whole connection is
+   already encrypted by TLS.
+
+When both are configured, a request must satisfy **both** the client certificate
+**and** valid credentials. If you configure neither, the server allows anonymous
+read access and prints a warning at startup.
 
 ## Features
 
@@ -29,9 +33,10 @@ connection is already encrypted by TLS.
   is never read into RAM.
 - Every mutating method (`PUT`, `DELETE`, `MKCOL`, `MOVE`, `COPY`,
   `PROPPATCH`, `LOCK`, …) is rejected with `405 Method Not Allowed`.
-- Requires a valid client certificate for every connection.
-- Optional HTTP Basic username/password auth, layered on top of the client
-  certificate (`401` challenge with `WWW-Authenticate` when missing/invalid).
+- Client-certificate auth that can be required, optional, or disabled.
+- Optional HTTP Basic username/password auth, layered on top of any
+  client-certificate auth (`401` challenge with `WWW-Authenticate` when
+  missing/invalid).
 - Rejects path traversal (`..`) so only files under `--root` are reachable.
 - Tiny dependency footprint: just `rustls` (with the `ring` provider) and
   `rustls-pemfile`. No async runtime, no HTTP framework.
@@ -64,20 +69,32 @@ into `certs/`.
   --addr      127.0.0.1:4443
 ```
 
-| Flag          | Meaning                                                        | Default            |
-|---------------|---------------------------------------------------------------|--------------------|
-| `--cert`      | PEM server certificate (chain) presented to clients           | *(required)*       |
-| `--key`       | PEM server private key                                        | *(required)*       |
-| `--client-ca` | PEM CA used to verify **client** certificates                 | *(required)*       |
-| `--root`      | Directory to serve (read-only)                                | current directory  |
-| `--addr`      | Listen address                                                | `127.0.0.1:4443`   |
-| `--auth-file` | File of `username:password` lines (`#` comments allowed)      | *(none)*           |
-| `--user`      | A single username (use together with `--password`)            | *(none)*           |
-| `--password`  | Password for `--user`                                         | *(none)*           |
-| `--realm`     | Basic-auth realm shown to clients                             | `tiny-webdav`      |
+| Flag                     | Meaning                                                            | Default            |
+|--------------------------|-------------------------------------------------------------------|--------------------|
+| `--cert`                 | PEM server certificate (chain) presented to clients               | *(required)*       |
+| `--key`                  | PEM server private key                                            | *(required)*       |
+| `--root`                 | Directory to serve (read-only)                                    | current directory  |
+| `--addr`                 | Listen address                                                    | `127.0.0.1:4443`   |
+| `--client-ca`            | PEM CA used to verify **client** certificates. Omit to disable client-cert auth. | *(none → disabled)* |
+| `--client-cert-optional` | Accept clients without a cert, but verify any cert presented (needs `--client-ca`) | required           |
+| `--auth-file`            | File of `username:password` lines (`#` comments allowed)          | *(none)*           |
+| `--user`                 | A single username (use together with `--password`)                | *(none)*           |
+| `--password`             | Password for `--user`                                             | *(none)*           |
+| `--realm`                | Basic-auth realm shown to clients                                 | `tiny-webdav`      |
 
-If no credentials are configured, Basic auth is disabled and only the client
-certificate is required.
+### Choosing an authentication mode
+
+| Goal                                   | Flags                                                        |
+|----------------------------------------|-------------------------------------------------------------|
+| Client cert required (mTLS only)       | `--client-ca ca.crt`                                         |
+| Username/password only (no client cert)| *(omit `--client-ca`)* `--auth-file users.txt`              |
+| Either works, but a login is always required | `--client-ca ca.crt --client-cert-optional --auth-file users.txt` |
+| Cert **and** password both required    | `--client-ca ca.crt --auth-file users.txt`                  |
+| Anonymous read access (no auth)        | *(omit both — prints a warning)*                            |
+
+If no credentials are configured, Basic auth is disabled. If `--client-ca` is
+omitted, client-certificate auth is disabled. With both disabled the server
+serves anyone who can reach it (and says so at startup).
 
 ### Username/password auth
 
