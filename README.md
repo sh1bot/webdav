@@ -36,6 +36,8 @@ read access and prints a warning at startup.
   `PROPPATCH`, `LOCK`, …) is rejected with `405 Method Not Allowed`.
 - Bring your own server certificate, or generate a self-signed one on the fly
   with `--self-signed` (handy for quick local testing).
+- Runs standalone (binds its own port) or under inetd/xinetd `nowait` with
+  `--inetd` (one process per connection, for concurrency).
 - Client-certificate auth that can be required, optional, or disabled.
 - Optional HTTP Basic username/password auth, layered on top of any
   client-certificate auth (`401` challenge with `WWW-Authenticate` when
@@ -122,6 +124,56 @@ into `certs/`.
 If no credentials are configured, Basic auth is disabled. If `--client-ca` is
 omitted, client-certificate auth is disabled. With both disabled the server
 serves anyone who can reach it (and says so at startup).
+
+## Running under inetd / xinetd
+
+By default the server binds a port and accepts connections itself (one at a
+time, single-threaded). Alternatively you can let **inetd**/**xinetd** own the
+listening socket and spawn one process per connection — which gives you
+concurrency across clients, each handled by its own process.
+
+inetd does **not** speak TLS; it just hands the accepted raw TCP socket to the
+program on stdin/stdout. tiny-webdav still performs the TLS handshake itself, so
+this works exactly as it does in standalone mode. Pass `--inetd` and use the
+`nowait` service type:
+
+`/etc/inetd.conf` entry (one line):
+
+```
+8443 stream tcp nowait nobody /usr/local/bin/tiny-webdav tiny-webdav \
+  --inetd --cert /etc/tiny-webdav/server.crt --key /etc/tiny-webdav/server.key \
+  --root /srv/files --auth-file /etc/tiny-webdav/users.txt \
+  --log-file /var/log/tiny-webdav.log
+```
+
+xinetd equivalent (`/etc/xinetd.d/tiny-webdav`):
+
+```
+service tiny-webdav {
+    type        = UNLISTED
+    port        = 8443
+    socket_type = stream
+    protocol    = tcp
+    wait        = no
+    user        = nobody
+    server      = /usr/local/bin/tiny-webdav
+    server_args = --inetd --cert /etc/tiny-webdav/server.crt --key /etc/tiny-webdav/server.key --root /srv/files --auth-file /etc/tiny-webdav/users.txt --log-file /var/log/tiny-webdav.log
+}
+```
+
+Notes for inetd mode:
+
+- The server reads the connection from **stdin (fd 0)**, serves it, and exits.
+  Use `nowait` so inetd forks a fresh process per connection (`wait` would let
+  only one connection be handled at a time).
+- Because inetd duplicates the client socket onto stdout/stderr too, the server
+  redirects those away on startup so no diagnostic can corrupt the TLS stream.
+  Use `--log-file <path>` to capture diagnostics; otherwise they go to
+  `/dev/null`.
+- `--addr` is ignored in `--inetd` mode (inetd owns the listening socket).
+- Prefer real `--cert`/`--key` files here; `--self-signed` would generate a new
+  certificate for every connection.
+- `--inetd` is Unix-only.
 
 ### Username/password auth
 

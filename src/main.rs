@@ -38,6 +38,8 @@ struct Args {
     user: Option<String>,
     password: Option<String>,
     realm: String,
+    inetd: bool,
+    log_file: Option<PathBuf>,
 }
 
 fn usage() -> ! {
@@ -49,6 +51,11 @@ fn usage() -> ! {
          OPTIONS:\n  \
            --root                  Directory to serve (default: current directory)\n  \
            --addr                  Listen address (default: 127.0.0.1:4443)\n\n  \
+           Running under inetd/xinetd (one process per connection):\n  \
+           --inetd                 Serve a single connection passed on stdin (fd 0),\n                          \
+                       instead of binding/listening. Use the 'nowait' mode.\n  \
+           --log-file <file>       In --inetd mode, send diagnostics here instead of\n                          \
+                       /dev/null (stdout/stderr are the client socket).\n\n  \
            Server TLS identity (choose one):\n  \
            --cert <file>           PEM server certificate (chain) presented to clients\n  \
            --key <file>            PEM server private key (use with --cert)\n  \
@@ -85,6 +92,8 @@ fn parse_args() -> Args {
     let mut user: Option<String> = None;
     let mut password: Option<String> = None;
     let mut realm = "tiny-webdav".to_string();
+    let mut inetd = false;
+    let mut log_file: Option<PathBuf> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -102,6 +111,8 @@ fn parse_args() -> Args {
             "--user" => user = Some(it.next().unwrap_or_else(|| usage())),
             "--password" => password = Some(it.next().unwrap_or_else(|| usage())),
             "--realm" => realm = it.next().unwrap_or_else(|| usage()),
+            "--inetd" => inetd = true,
+            "--log-file" => log_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("error: unexpected argument '{}'\n", other);
@@ -152,6 +163,8 @@ fn parse_args() -> Args {
         user,
         password,
         realm,
+        inetd,
+        log_file,
     }
 }
 
@@ -277,8 +290,76 @@ fn serve_connection(
     Ok(())
 }
 
+/// Serve the single connection inetd handed us on stdin (fd 0), then return.
+#[cfg(unix)]
+fn serve_inetd(config: Arc<ServerConfig>, root: &Path, auth: &Auth) {
+    use std::os::unix::io::FromRawFd;
+
+    // Safety: under inetd, fd 0 is the connected, owned TCP socket. We take
+    // ownership of it; it is closed when the resulting TcpStream is dropped.
+    let sock = unsafe { TcpStream::from_raw_fd(0) };
+    let peer = sock
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    if let Err(e) = serve_connection(config, root, auth, sock) {
+        eprintln!("[{}] connection error: {}", peer, e);
+    }
+}
+
+#[cfg(not(unix))]
+fn serve_inetd(_config: Arc<ServerConfig>, _root: &Path, _auth: &Auth) {
+    eprintln!("error: --inetd is only supported on Unix platforms");
+    process::exit(1);
+}
+
+/// In inetd mode the client socket is duplicated onto stdout and stderr, so
+/// point fd 1 (and fd 2) somewhere harmless before we emit anything. fd 1
+/// always goes to /dev/null; fd 2 goes to `--log-file` if given, else
+/// /dev/null. fd 0 (the socket we actually serve) is left untouched.
+#[cfg(unix)]
+fn protect_inetd_streams(log_file: Option<&Path>) {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+
+    let devnull = OpenOptions::new().write(true).open("/dev/null");
+    if let Ok(n) = &devnull {
+        unsafe { libc::dup2(n.as_raw_fd(), 1) };
+    }
+
+    // stderr: a log file if requested and openable, otherwise /dev/null.
+    let logged = log_file.and_then(|p| {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+            .map(|f| {
+                unsafe { libc::dup2(f.as_raw_fd(), 2) };
+                f
+            })
+    });
+    if logged.is_none() {
+        if let Ok(n) = &devnull {
+            unsafe { libc::dup2(n.as_raw_fd(), 2) };
+        }
+    }
+    // `devnull`/`logged` File handles drop here, closing their original fds;
+    // the dup2'd descriptors 1 and 2 remain valid.
+}
+
+#[cfg(not(unix))]
+fn protect_inetd_streams(_log_file: Option<&Path>) {}
+
 fn main() {
     let args = parse_args();
+
+    // In inetd mode stdin/stdout/stderr are the client socket. Redirect
+    // stdout and stderr away *first* so no diagnostic ever leaks onto the
+    // wire and corrupts the TLS stream. Done before any other output.
+    if args.inetd {
+        protect_inetd_streams(args.log_file.as_deref());
+    }
 
     // Install the `ring` crypto provider as the process default.
     if rustls::crypto::ring::default_provider()
@@ -315,6 +396,15 @@ fn main() {
             process::exit(1);
         }
     };
+
+    // inetd mode: there is no listener. inetd has already accepted the
+    // connection and handed us the socket on stdin. Confine the process, serve
+    // that one connection, and exit so inetd can fork the next one.
+    if args.inetd {
+        let serve_root = lower_privileges(&canonical_root);
+        serve_inetd(config, &serve_root, &auth);
+        return;
+    }
 
     let listener = match TcpListener::bind(&args.addr) {
         Ok(l) => l,
