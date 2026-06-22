@@ -235,44 +235,85 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
     RangeSpec::Satisfiable { start, end }
 }
 
+struct IndexEntry {
+    name: String,
+    is_dir: bool,
+    /// Last-modified time, if the filesystem reports one.
+    modified: Option<SystemTime>,
+    /// Size in bytes (meaningful for files only).
+    len: u64,
+}
+
 fn directory_index_html(decoded_path: &str, fs_path: &Path) -> String {
-    let mut entries: Vec<(String, bool)> = Vec::new();
+    let mut entries: Vec<IndexEntry> = Vec::new();
     if let Ok(rd) = fs::read_dir(fs_path) {
         for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            entries.push((name, is_dir));
+            // Follow symlinks so size/date match what GET would actually serve.
+            // Fall back to the entry's own type if the target can't be stat'd.
+            let md = fs::metadata(e.path()).ok();
+            let is_dir = md
+                .as_ref()
+                .map(|m| m.is_dir())
+                .or_else(|| e.file_type().map(|t| t.is_dir()).ok())
+                .unwrap_or(false);
+            entries.push(IndexEntry {
+                name: e.file_name().to_string_lossy().into_owned(),
+                is_dir,
+                modified: md.as_ref().and_then(|m| m.modified().ok()),
+                len: md.as_ref().map(|m| m.len()).unwrap_or(0),
+            });
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Directories first, then alphabetical.
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
 
     let base = if decoded_path.ends_with('/') {
         decoded_path.to_string()
     } else {
         format!("{}/", decoded_path)
     };
+    let title = util::xml_escape(decoded_path);
 
     let mut html = String::new();
     html.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">");
-    html.push_str(&format!(
-        "<title>Index of {}</title></head><body>",
-        util::xml_escape(decoded_path)
-    ));
-    html.push_str(&format!("<h1>Index of {}</h1><ul>", util::xml_escape(decoded_path)));
+    html.push_str(&format!("<title>Index of {}</title>", title));
+    html.push_str(
+        "<style>body{font-family:sans-serif;margin:1.5rem}\
+         h1{font-size:1.1rem}table{border-collapse:collapse}\
+         th,td{text-align:left;padding:.2rem 1.2rem .2rem 0;white-space:nowrap}\
+         th{border-bottom:1px solid #ccc}td.size{text-align:right;font-variant-numeric:tabular-nums}\
+         td.date{font-variant-numeric:tabular-nums;color:#444}</style></head><body>",
+    );
+    html.push_str(&format!("<h1>Index of {}</h1>", title));
+    html.push_str(
+        "<table><thead><tr><th>Name</th><th>Last modified (UTC)</th><th>Size</th></tr></thead><tbody>",
+    );
+
     if decoded_path != "/" {
-        html.push_str("<li><a href=\"../\">../</a></li>");
+        html.push_str("<tr><td><a href=\"../\">../</a></td><td></td><td></td></tr>");
     }
-    for (name, is_dir) in entries {
-        let suffix = if is_dir { "/" } else { "" };
-        let href = util::percent_encode_path(&format!("{}{}{}", base, name, suffix));
+    for e in entries {
+        let suffix = if e.is_dir { "/" } else { "" };
+        let href = util::percent_encode_path(&format!("{}{}{}", base, e.name, suffix));
+        let modified = e
+            .modified
+            .map(util::datetime_utc)
+            .unwrap_or_else(|| "-".to_string());
+        let size = if e.is_dir {
+            "-".to_string()
+        } else {
+            util::human_size(e.len)
+        };
         html.push_str(&format!(
-            "<li><a href=\"{}\">{}{}</a></li>",
+            "<tr><td><a href=\"{}\">{}{}</a></td><td class=\"date\">{}</td><td class=\"size\">{}</td></tr>",
             href,
-            util::xml_escape(&name),
-            suffix
+            util::xml_escape(&e.name),
+            suffix,
+            modified,
+            size,
         ));
     }
-    html.push_str("</ul></body></html>");
+    html.push_str("</tbody></table></body></html>");
     html
 }
 

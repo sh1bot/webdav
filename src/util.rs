@@ -162,6 +162,39 @@ pub fn http_date(t: SystemTime) -> String {
     )
 }
 
+/// Format a `SystemTime` as a compact UTC timestamp `YYYY-MM-DD HH:MM:SS`,
+/// suitable for a human-readable directory listing.
+pub fn datetime_utc(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (year, month, mday) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, mday, hour, min, sec
+    )
+}
+
+/// Render a byte count compactly: plain bytes below 1 KiB, otherwise a single
+/// decimal with a binary unit suffix (e.g. `1.4K`, `3.2M`).
+pub fn human_size(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
+    if n < 1024 {
+        return format!("{} B", n);
+    }
+    let mut size = n as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{:.1}{}", size, UNITS[unit])
+}
+
 /// Convert days since the Unix epoch to a (year, month, day) civil date.
 /// Based on Howard Hinnant's `civil_from_days` algorithm.
 fn civil_from_days(z: i64) -> (i64, i64, i64) {

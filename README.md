@@ -23,7 +23,8 @@ read access and prints a warning at startup.
 - Serves a directory read-only over HTTPS.
 - Supports the WebDAV verbs needed for browsing/reading:
   - `OPTIONS` (advertises `DAV: 1`)
-  - `GET` / `HEAD` (files; directories return a simple HTML index)
+  - `GET` / `HEAD` (files; directories return an HTML index listing each
+    entry's name, last-modified time in UTC, and size)
   - `PROPFIND` (`Depth: 0` and `Depth: 1`) returning `207 Multi-Status`
 - HTTP `Range` requests (single `bytes=` ranges) for partial/resumable
   downloads: responds `206 Partial Content` with `Content-Range`, `416` for
