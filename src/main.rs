@@ -350,6 +350,13 @@ fn main() {
         );
     }
 
+    // Everything that needs the filesystem or privileged ports is done (certs
+    // and credentials are in memory, the socket is bound). Now confine the
+    // process: chroot into the served directory and drop to an unprivileged
+    // user. If we lack the privileges, this just warns and carries on. The
+    // returned path is the root to serve from afterwards (`/` once chrooted).
+    let serve_root = lower_privileges(&canonical_root);
+
     // Single-threaded: handle one connection fully, then move to the next.
     for incoming in listener.incoming() {
         match incoming {
@@ -358,7 +365,7 @@ fn main() {
                     .peer_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "?".to_string());
-                if let Err(e) = serve_connection(config.clone(), &canonical_root, &auth, tcp) {
+                if let Err(e) = serve_connection(config.clone(), &serve_root, &auth, tcp) {
                     // A failed/rejected client handshake lands here too; log briefly.
                     eprintln!("[{}] connection error: {}", peer, e);
                 }
@@ -366,4 +373,82 @@ fn main() {
             Err(e) => eprintln!("accept error: {}", e),
         }
     }
+}
+
+/// Confine the process after startup: `chroot` into `root`, then drop to the
+/// unprivileged `nobody` account. Returns the path to serve from afterwards —
+/// `/` when the chroot succeeds (the served directory becomes the new root),
+/// otherwise `root` unchanged. Any lack of privilege is reported on stderr and
+/// is non-fatal.
+#[cfg(unix)]
+fn lower_privileges(root: &Path) -> PathBuf {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // If we're not effectively root we can't chroot or change uid; say so once
+    // and carry on with current privileges.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("not running as root: skipping chroot and privilege drop");
+        return root.to_path_buf();
+    }
+
+    // Resolve the `nobody` account *before* chrooting, while /etc is reachable.
+    let (uid, gid) = unsafe {
+        let pw = libc::getpwnam(c"nobody".as_ptr());
+        if pw.is_null() {
+            (65534, 65534) // conventional nobody / nogroup ids
+        } else {
+            ((*pw).pw_uid, (*pw).pw_gid)
+        }
+    };
+
+    let mut serve_root = root.to_path_buf();
+
+    // chroot into the served directory, then make it the working directory.
+    match CString::new(root.as_os_str().as_bytes()) {
+        Ok(c_root) => unsafe {
+            if libc::chroot(c_root.as_ptr()) == 0 && libc::chdir(c"/".as_ptr()) == 0 {
+                serve_root = PathBuf::from("/");
+                println!("chroot: confined to {}", root.display());
+            } else {
+                eprintln!(
+                    "chroot to {} failed ({}); carrying on without chroot",
+                    root.display(),
+                    io::Error::last_os_error()
+                );
+            }
+        },
+        Err(_) => eprintln!("chroot skipped: root path contains an interior NUL byte"),
+    }
+
+    // Drop supplementary groups, then gid, then uid (must be in this order).
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            eprintln!("setgroups failed ({})", io::Error::last_os_error());
+        }
+        if libc::setgid(gid) != 0 {
+            eprintln!(
+                "setgid({}) failed ({}); carrying on as current group",
+                gid,
+                io::Error::last_os_error()
+            );
+        }
+        if libc::setuid(uid) != 0 {
+            eprintln!(
+                "setuid({}) failed ({}); carrying on as current user",
+                uid,
+                io::Error::last_os_error()
+            );
+        } else {
+            println!("dropped privileges to nobody (uid={}, gid={})", uid, gid);
+        }
+    }
+
+    serve_root
+}
+
+#[cfg(not(unix))]
+fn lower_privileges(root: &Path) -> PathBuf {
+    eprintln!("chroot/privilege drop not supported on this platform; carrying on");
+    root.to_path_buf()
 }

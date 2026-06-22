@@ -18,5 +18,9 @@ rustls-pemfile = "2"
 # `ring` backend matches the rustls crypto provider; `pem` lets us export it.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
+# Unix privilege dropping: chroot + setuid/setgid to nobody after setup.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 2

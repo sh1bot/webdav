@@ -196,6 +196,14 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
   the loop, but a hostile client can still reduce throughput.
 - Symlinks under `--root` are followed; don't place symlinks that point outside
   the served tree if that matters to you.
+- **Privilege dropping:** once all setup is done (certificates and credentials
+  loaded into memory, listening socket bound), the process tries to `chroot`
+  into the served directory and drop to the `nobody` user/group. After a
+  successful `chroot` the served directory becomes `/`, so nothing outside it is
+  reachable even via symlinks. This requires starting as root (e.g. to also bind
+  a privileged port); if the process isn't privileged enough, it prints a note
+  to stderr and carries on without confining itself. For the dropped `nobody`
+  user to actually read the files, they must be readable by that account.
 - The example certificates from `gen-certs.sh` are for testing only. Use your
   own PKI in production and keep private keys readable only by their owner.
 ```
