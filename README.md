@@ -3,11 +3,16 @@
 A very small, **single-threaded, read-only** WebDAV server written in Rust, with
 **TLS client-certificate authentication** (mutual TLS).
 
-There are no passwords. Authentication is "private key sign-in": each client
-holds a private key + certificate signed by a CA the server trusts, and the TLS
-handshake itself proves the client possesses that private key. This is a native
-feature of TLS/HTTPS — usually called **mutual TLS (mTLS)** or client-certificate
+The primary authentication is "private key sign-in": each client holds a private
+key + certificate signed by a CA the server trusts, and the TLS handshake itself
+proves the client possesses that private key. This is a native feature of
+TLS/HTTPS — usually called **mutual TLS (mTLS)** or client-certificate
 authentication.
+
+Optionally, you can also require **HTTP Basic username/password** on top of the
+client certificate. When configured, a request must satisfy **both** the client
+certificate **and** valid credentials. Basic auth is safe here because the whole
+connection is already encrypted by TLS.
 
 ## Features
 
@@ -25,6 +30,8 @@ authentication.
 - Every mutating method (`PUT`, `DELETE`, `MKCOL`, `MOVE`, `COPY`,
   `PROPPATCH`, `LOCK`, …) is rejected with `405 Method Not Allowed`.
 - Requires a valid client certificate for every connection.
+- Optional HTTP Basic username/password auth, layered on top of the client
+  certificate (`401` challenge with `WWW-Authenticate` when missing/invalid).
 - Rejects path traversal (`..`) so only files under `--root` are reachable.
 - Tiny dependency footprint: just `rustls` (with the `ring` provider) and
   `rustls-pemfile`. No async runtime, no HTTP framework.
@@ -64,6 +71,36 @@ into `certs/`.
 | `--client-ca` | PEM CA used to verify **client** certificates                 | *(required)*       |
 | `--root`      | Directory to serve (read-only)                                | current directory  |
 | `--addr`      | Listen address                                                | `127.0.0.1:4443`   |
+| `--auth-file` | File of `username:password` lines (`#` comments allowed)      | *(none)*           |
+| `--user`      | A single username (use together with `--password`)            | *(none)*           |
+| `--password`  | Password for `--user`                                         | *(none)*           |
+| `--realm`     | Basic-auth realm shown to clients                             | `tiny-webdav`      |
+
+If no credentials are configured, Basic auth is disabled and only the client
+certificate is required.
+
+### Username/password auth
+
+Either point at a credentials file...
+
+```sh
+cat > users.txt <<'EOF'
+# username:password   (the password may itself contain ':')
+alice:s3cret
+bob:p@ss:word
+EOF
+
+./target/release/tiny-webdav \
+  --cert certs/server.crt --key certs/server.key --client-ca certs/ca.crt \
+  --root ./served --auth-file users.txt
+```
+
+...or pass a single user inline (note: arguments are visible in `ps`, so prefer
+`--auth-file` for anything real):
+
+```sh
+./target/release/tiny-webdav ... --user alice --password s3cret
+```
 
 ## Connect
 
@@ -73,6 +110,15 @@ With `curl` (note: a client cert is mandatory — omitting it fails the handshak
 curl --cacert certs/ca.crt \
      --cert   certs/client.crt \
      --key    certs/client.key \
+     https://localhost:4443/hello.txt
+```
+
+If username/password auth is enabled, add `-u user:password` as well — the
+client certificate alone is no longer sufficient:
+
+```sh
+curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
+     -u alice:s3cret \
      https://localhost:4443/hello.txt
 ```
 

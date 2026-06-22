@@ -5,6 +5,7 @@
 //! private key + certificate signed by a CA we trust. The TLS handshake itself
 //! proves the client possesses the private key, so there are no passwords.
 
+mod auth;
 mod dav;
 mod http;
 mod util;
@@ -21,12 +22,18 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig, ServerConnection};
 
+use auth::Auth;
+
 struct Args {
     addr: String,
     root: PathBuf,
     cert: PathBuf,
     key: PathBuf,
     client_ca: PathBuf,
+    auth_file: Option<PathBuf>,
+    user: Option<String>,
+    password: Option<String>,
+    realm: String,
 }
 
 fn usage() -> ! {
@@ -40,7 +47,12 @@ fn usage() -> ! {
            --key        PEM server private key\n  \
            --client-ca  PEM CA certificate used to verify client certificates\n  \
            --root       Directory to serve (default: current directory)\n  \
-           --addr       Listen address (default: 127.0.0.1:4443)\n"
+           --addr       Listen address (default: 127.0.0.1:4443)\n\n  \
+           Optional HTTP Basic auth (layered on top of the client cert):\n  \
+           --auth-file  File of 'username:password' lines (# comments allowed)\n  \
+           --user       A single username (use with --password)\n  \
+           --password   Password for --user\n  \
+           --realm      Basic-auth realm shown to clients (default: tiny-webdav)\n"
     );
     process::exit(2);
 }
@@ -51,6 +63,10 @@ fn parse_args() -> Args {
     let mut cert: Option<PathBuf> = None;
     let mut key: Option<PathBuf> = None;
     let mut client_ca: Option<PathBuf> = None;
+    let mut auth_file: Option<PathBuf> = None;
+    let mut user: Option<String> = None;
+    let mut password: Option<String> = None;
+    let mut realm = "tiny-webdav".to_string();
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -60,6 +76,10 @@ fn parse_args() -> Args {
             "--cert" => cert = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--key" => key = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--client-ca" => client_ca = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--auth-file" => auth_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--user" => user = Some(it.next().unwrap_or_else(|| usage())),
+            "--password" => password = Some(it.next().unwrap_or_else(|| usage())),
+            "--realm" => realm = it.next().unwrap_or_else(|| usage()),
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("error: unexpected argument '{}'\n", other);
@@ -68,13 +88,39 @@ fn parse_args() -> Args {
         }
     }
 
+    if user.is_some() != password.is_some() {
+        eprintln!("error: --user and --password must be given together\n");
+        usage();
+    }
+
     match (cert, key, client_ca) {
-        (Some(cert), Some(key), Some(client_ca)) => Args { addr, root, cert, key, client_ca },
+        (Some(cert), Some(key), Some(client_ca)) => Args {
+            addr,
+            root,
+            cert,
+            key,
+            client_ca,
+            auth_file,
+            user,
+            password,
+            realm,
+        },
         _ => {
             eprintln!("error: --cert, --key and --client-ca are all required\n");
             usage();
         }
     }
+}
+
+fn build_auth(args: &Args) -> io::Result<Auth> {
+    let mut auth = Auth::new(args.realm.clone());
+    if let Some(path) = &args.auth_file {
+        auth.load_file(path)?;
+    }
+    if let (Some(u), Some(p)) = (&args.user, &args.password) {
+        auth.add(u.clone(), p.clone());
+    }
+    Ok(auth)
 }
 
 fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
@@ -123,7 +169,12 @@ fn build_tls_config(args: &Args) -> io::Result<ServerConfig> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
-fn serve_connection(config: Arc<ServerConfig>, root: &Path, mut tcp: TcpStream) -> io::Result<()> {
+fn serve_connection(
+    config: Arc<ServerConfig>,
+    root: &Path,
+    auth: &Auth,
+    mut tcp: TcpStream,
+) -> io::Result<()> {
     // Bound how long a single (single-threaded!) connection can stall us.
     tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -135,7 +186,7 @@ fn serve_connection(config: Arc<ServerConfig>, root: &Path, mut tcp: TcpStream) 
         // rustls::Stream drives the TLS handshake transparently on first I/O.
         let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
         let req = http::read_request(&mut tls)?;
-        dav::handle(&mut tls, root, &req)?;
+        dav::handle(&mut tls, root, auth, &req)?;
     }
 
     // Best-effort clean TLS shutdown.
@@ -175,6 +226,14 @@ fn main() {
         }
     };
 
+    let auth = match build_auth(&args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: cannot load credentials: {}", e);
+            process::exit(1);
+        }
+    };
+
     let listener = match TcpListener::bind(&args.addr) {
         Ok(l) => l,
         Err(e) => {
@@ -186,6 +245,15 @@ fn main() {
     println!("tiny-webdav listening on https://{}", args.addr);
     println!("serving (read-only): {}", canonical_root.display());
     println!("client-certificate authentication: REQUIRED");
+    if auth.is_enabled() {
+        println!(
+            "HTTP Basic authentication: REQUIRED ({} user(s), realm \"{}\")",
+            auth.user_count(),
+            args.realm
+        );
+    } else {
+        println!("HTTP Basic authentication: disabled");
+    }
 
     // Single-threaded: handle one connection fully, then move to the next.
     for incoming in listener.incoming() {
@@ -195,7 +263,7 @@ fn main() {
                     .peer_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "?".to_string());
-                if let Err(e) = serve_connection(config.clone(), &canonical_root, tcp) {
+                if let Err(e) = serve_connection(config.clone(), &canonical_root, &auth, tcp) {
                     // A failed/rejected client handshake lands here too; log briefly.
                     eprintln!("[{}] connection error: {}", peer, e);
                 }

@@ -7,12 +7,23 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
+use crate::auth::Auth;
 use crate::http::{self, Request};
 use crate::util;
 
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND";
 
-pub fn handle<S: Read + Write>(stream: &mut S, root: &Path, req: &Request) -> io::Result<()> {
+pub fn handle<S: Read + Write>(
+    stream: &mut S,
+    root: &Path,
+    auth: &Auth,
+    req: &Request,
+) -> io::Result<()> {
+    // Require valid Basic credentials (if configured) before doing anything.
+    if !auth.authorize(req) {
+        return auth.challenge(stream);
+    }
+
     // Percent-decode and sanitise the request path before touching disk.
     let decoded = util::percent_decode(&req.path);
     let fs_path = match util::resolve_within(root, &decoded) {

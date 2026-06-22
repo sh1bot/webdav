@@ -7,3 +7,6 @@
 *.csr
 *.srl
 *.p12
+# Local credential files for testing.
+/auth.txt
+/users.txt
