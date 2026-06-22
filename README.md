@@ -33,6 +33,8 @@ read access and prints a warning at startup.
   is never read into RAM.
 - Every mutating method (`PUT`, `DELETE`, `MKCOL`, `MOVE`, `COPY`,
   `PROPPATCH`, `LOCK`, …) is rejected with `405 Method Not Allowed`.
+- Bring your own server certificate, or generate a self-signed one on the fly
+  with `--self-signed` (handy for quick local testing).
 - Client-certificate auth that can be required, optional, or disabled.
 - Optional HTTP Basic username/password auth, layered on top of any
   client-certificate auth (`401` challenge with `WWW-Authenticate` when
@@ -46,6 +48,27 @@ read access and prints a warning at startup.
 ```sh
 cargo build --release
 ```
+
+## Quick start with a self-signed certificate
+
+For local testing you don't need to create a server certificate at all — let the
+server generate one and write it out so your client can trust it:
+
+```sh
+./target/release/tiny-webdav \
+  --self-signed --write-cert /tmp/srv.pem \
+  --root ./served --user alice --password s3cret
+
+# in another terminal:
+curl --cacert /tmp/srv.pem -u alice:s3cret https://localhost:4443/
+# ...or skip trust entirely for throwaway testing:
+curl -k -u alice:s3cret https://localhost:4443/
+```
+
+Add `--hostname <name>` (repeatable) if you need the certificate to be valid for
+names other than `localhost`/`127.0.0.1`/`::1`. A self-signed server certificate
+is fine for testing, but clients can't verify it against a public CA, so use a
+real certificate (or your own CA) for anything beyond local use.
 
 ## Generate test certificates
 
@@ -71,8 +94,11 @@ into `certs/`.
 
 | Flag                     | Meaning                                                            | Default            |
 |--------------------------|-------------------------------------------------------------------|--------------------|
-| `--cert`                 | PEM server certificate (chain) presented to clients               | *(required)*       |
-| `--key`                  | PEM server private key                                            | *(required)*       |
+| `--cert`                 | PEM server certificate (chain) presented to clients               | *(required unless `--self-signed`)* |
+| `--key`                  | PEM server private key                                            | *(required unless `--self-signed`)* |
+| `--self-signed`          | Generate an in-memory self-signed server cert (testing)           | off                |
+| `--hostname`             | SAN for the self-signed cert; repeatable                          | `localhost`, `127.0.0.1`, `::1` |
+| `--write-cert`           | Write the generated self-signed cert (PEM) to this path           | *(none)*           |
 | `--root`                 | Directory to serve (read-only)                                    | current directory  |
 | `--addr`                 | Listen address                                                    | `127.0.0.1:4443`   |
 | `--client-ca`            | PEM CA used to verify **client** certificates. Omit to disable client-cert auth. | *(none → disabled)* |

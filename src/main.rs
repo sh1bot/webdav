@@ -27,8 +27,11 @@ use auth::Auth;
 struct Args {
     addr: String,
     root: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    self_signed: bool,
+    hostnames: Vec<String>,
+    write_cert: Option<PathBuf>,
     client_ca: Option<PathBuf>,
     client_cert_optional: bool,
     auth_file: Option<PathBuf>,
@@ -41,13 +44,19 @@ fn usage() -> ! {
     eprintln!(
         "tiny-webdav — read-only WebDAV over TLS\n\n\
          USAGE:\n  \
-           tiny-webdav --cert <server.crt> --key <server.key> \\\n             \
+           tiny-webdav (--cert <server.crt> --key <server.key> | --self-signed) \\\n             \
                        [--client-ca <ca.crt>] [--root <dir>] [--addr <host:port>]\n\n\
          OPTIONS:\n  \
-           --cert                  PEM server certificate (chain) presented to clients\n  \
-           --key                   PEM server private key\n  \
            --root                  Directory to serve (default: current directory)\n  \
            --addr                  Listen address (default: 127.0.0.1:4443)\n\n  \
+           Server TLS identity (choose one):\n  \
+           --cert <file>           PEM server certificate (chain) presented to clients\n  \
+           --key <file>            PEM server private key (use with --cert)\n  \
+           --self-signed           Generate an in-memory self-signed cert (testing)\n  \
+           --hostname <name>       SAN for the self-signed cert; repeatable\n                          \
+                       (default: localhost, 127.0.0.1, ::1)\n  \
+           --write-cert <file>     Write the self-signed cert (PEM) here so clients\n                          \
+                       can trust it (e.g. curl --cacert)\n\n  \
            Client-certificate auth (mTLS):\n  \
            --client-ca <ca.crt>    Verify client certs against this CA. Omit to\n                          \
                        disable client-cert auth entirely.\n  \
@@ -67,6 +76,9 @@ fn parse_args() -> Args {
     let mut root = PathBuf::from(".");
     let mut cert: Option<PathBuf> = None;
     let mut key: Option<PathBuf> = None;
+    let mut self_signed = false;
+    let mut hostnames: Vec<String> = Vec::new();
+    let mut write_cert: Option<PathBuf> = None;
     let mut client_ca: Option<PathBuf> = None;
     let mut client_cert_optional = false;
     let mut auth_file: Option<PathBuf> = None;
@@ -81,6 +93,9 @@ fn parse_args() -> Args {
             "--root" => root = PathBuf::from(it.next().unwrap_or_else(|| usage())),
             "--cert" => cert = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--key" => key = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--self-signed" => self_signed = true,
+            "--hostname" => hostnames.push(it.next().unwrap_or_else(|| usage())),
+            "--write-cert" => write_cert = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--client-ca" => client_ca = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--client-cert-optional" => client_cert_optional = true,
             "--auth-file" => auth_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
@@ -105,23 +120,38 @@ fn parse_args() -> Args {
         usage();
     }
 
-    match (cert, key) {
-        (Some(cert), Some(key)) => Args {
-            addr,
-            root,
-            cert,
-            key,
-            client_ca,
-            client_cert_optional,
-            auth_file,
-            user,
-            password,
-            realm,
-        },
-        _ => {
-            eprintln!("error: --cert and --key are required\n");
+    // Validate the server TLS identity: exactly one of (--cert + --key) or
+    // --self-signed. The two are mutually exclusive.
+    if self_signed {
+        if cert.is_some() || key.is_some() {
+            eprintln!("error: --self-signed cannot be combined with --cert/--key\n");
             usage();
         }
+    } else {
+        if !hostnames.is_empty() || write_cert.is_some() {
+            eprintln!("error: --hostname/--write-cert only apply with --self-signed\n");
+            usage();
+        }
+        if cert.is_none() || key.is_none() {
+            eprintln!("error: provide --cert and --key, or use --self-signed\n");
+            usage();
+        }
+    }
+
+    Args {
+        addr,
+        root,
+        cert,
+        key,
+        self_signed,
+        hostnames,
+        write_cert,
+        client_ca,
+        client_cert_optional,
+        auth_file,
+        user,
+        password,
+        realm,
     }
 }
 
@@ -158,9 +188,39 @@ fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
     })
 }
 
+/// Produce the server's certificate chain and private key, either by loading
+/// the supplied PEM files or by generating a fresh self-signed certificate.
+fn server_identity(args: &Args) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    if args.self_signed {
+        // Default SANs cover the common local-testing names.
+        let sans = if args.hostnames.is_empty() {
+            vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()]
+        } else {
+            args.hostnames.clone()
+        };
+        let generated = rcgen::generate_simple_self_signed(sans.clone())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        if let Some(path) = &args.write_cert {
+            std::fs::write(path, generated.cert.pem())?;
+            println!("wrote self-signed certificate to {}", path.display());
+        }
+
+        println!("using a generated self-signed certificate (SANs: {})", sans.join(", "));
+        let cert_der = generated.cert.der().clone();
+        let key_der = PrivateKeyDer::try_from(generated.key_pair.serialize_der())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok((vec![cert_der], key_der))
+    } else {
+        // Validated in parse_args: both are present here.
+        let certs = load_certs(args.cert.as_ref().unwrap())?;
+        let key = load_key(args.key.as_ref().unwrap())?;
+        Ok((certs, key))
+    }
+}
+
 fn build_tls_config(args: &Args) -> io::Result<ServerConfig> {
-    let server_certs = load_certs(&args.cert)?;
-    let server_key = load_key(&args.key)?;
+    let (server_certs, server_key) = server_identity(args)?;
 
     let to_invalid = |e: rustls::Error| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
 

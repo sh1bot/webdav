@@ -14,6 +14,9 @@ path = "src/main.rs"
 # build of aws-lc. `ring` still needs a C toolchain but is lightweight.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
+# Used only for `--self-signed`: generate an in-memory server certificate.
+# `ring` backend matches the rustls crypto provider; `pem` lets us export it.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [profile.release]
 opt-level = 2
