@@ -16,6 +16,10 @@ authentication.
   - `OPTIONS` (advertises `DAV: 1`)
   - `GET` / `HEAD` (files; directories return a simple HTML index)
   - `PROPFIND` (`Depth: 0` and `Depth: 1`) returning `207 Multi-Status`
+- HTTP `Range` requests (single `bytes=` ranges) for partial/resumable
+  downloads: responds `206 Partial Content` with `Content-Range`, `416` for
+  unsatisfiable ranges, and advertises `Accept-Ranges: bytes`. Ranges are
+  served by seeking, so a slice never loads the whole file into memory.
 - Every mutating method (`PUT`, `DELETE`, `MKCOL`, `MOVE`, `COPY`,
   `PROPPATCH`, `LOCK`, …) is rejected with `405 Method Not Allowed`.
 - Requires a valid client certificate for every connection.

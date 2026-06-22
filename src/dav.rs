@@ -22,8 +22,8 @@ pub fn handle<S: Read + Write>(stream: &mut S, root: &Path, req: &Request) -> io
 
     match req.method.as_str() {
         "OPTIONS" => options(stream),
-        "GET" => get_or_head(stream, root, &decoded, &fs_path, true),
-        "HEAD" => get_or_head(stream, root, &decoded, &fs_path, false),
+        "GET" => get_or_head(stream, &decoded, &fs_path, req, true),
+        "HEAD" => get_or_head(stream, &decoded, &fs_path, req, false),
         "PROPFIND" => propfind(stream, root, &decoded, &fs_path, req),
         // Read-only: reject every mutating / unsupported method.
         _ => http::write_response(
@@ -56,9 +56,9 @@ fn options<S: Write>(stream: &mut S) -> io::Result<()> {
 
 fn get_or_head<S: Write>(
     stream: &mut S,
-    root: &Path,
     decoded_path: &str,
     fs_path: &Path,
+    req: &Request,
     send_body: bool,
 ) -> io::Result<()> {
     let meta = match fs::metadata(fs_path) {
@@ -80,27 +80,154 @@ fn get_or_head<S: Write>(
         );
     }
 
-    let data = match fs::read(fs_path) {
-        Ok(d) => d,
-        Err(_) => return http::write_status(stream, 404, "Not Found"),
-    };
-
+    let len = meta.len();
     let mut headers: Vec<(&str, String)> = Vec::new();
     if let Ok(modified) = meta.modified() {
         headers.push(("Last-Modified", util::http_date(modified)));
     }
-    headers.push(("Accept-Ranges", "none".to_string()));
+    // We honour single byte ranges; advertise that to clients.
+    headers.push(("Accept-Ranges", "bytes".to_string()));
 
-    let _ = root; // root only needed for resolution, kept for symmetry.
-    http::write_response(
-        stream,
-        200,
-        "OK",
-        util::mime_for(fs_path),
-        &headers,
-        &data,
-        send_body,
-    )
+    let content_type = util::mime_for(fs_path);
+
+    match req.header("range").map(|r| parse_byte_range(r, len)) {
+        // A range was requested and it is satisfiable: 206 Partial Content.
+        Some(RangeSpec::Satisfiable { start, end }) => {
+            let data = match read_slice(fs_path, start, end) {
+                Ok(d) => d,
+                Err(_) => return http::write_status(stream, 404, "Not Found"),
+            };
+            headers.push((
+                "Content-Range",
+                format!("bytes {}-{}/{}", start, end, len),
+            ));
+            http::write_response(
+                stream,
+                206,
+                "Partial Content",
+                content_type,
+                &headers,
+                &data,
+                send_body,
+            )
+        }
+        // A range was requested but cannot be satisfied: 416.
+        Some(RangeSpec::Unsatisfiable) => {
+            http::write_response(
+                stream,
+                416,
+                "Range Not Satisfiable",
+                "text/plain; charset=utf-8",
+                &[("Content-Range", format!("bytes */{}", len))],
+                b"416 Range Not Satisfiable\n",
+                true,
+            )
+        }
+        // No usable Range header: serve the whole file (200).
+        _ => {
+            let data = match fs::read(fs_path) {
+                Ok(d) => d,
+                Err(_) => return http::write_status(stream, 404, "Not Found"),
+            };
+            http::write_response(
+                stream,
+                200,
+                "OK",
+                content_type,
+                &headers,
+                &data,
+                send_body,
+            )
+        }
+    }
+}
+
+/// The outcome of interpreting a `Range` header against a known content length.
+enum RangeSpec {
+    /// A single satisfiable range, inclusive of both endpoints.
+    Satisfiable { start: u64, end: u64 },
+    /// The header was a well-formed byte range that cannot be satisfied.
+    Unsatisfiable,
+    /// The header is absent/unsupported (e.g. multiple ranges, non-`bytes`
+    /// units, or unparseable); the caller should serve the full entity.
+    Ignore,
+}
+
+/// Parse a single-range `Range: bytes=...` header against `len` bytes.
+///
+/// Supports the three standard single-range forms:
+///   `bytes=START-END`, `bytes=START-`, and `bytes=-SUFFIXLEN`.
+/// Multiple comma-separated ranges and non-`bytes` units are ignored (the
+/// caller then serves the whole file, which the spec permits).
+fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
+    let spec = match value.trim().strip_prefix("bytes=") {
+        Some(s) => s.trim(),
+        None => return RangeSpec::Ignore,
+    };
+
+    // We only implement single ranges; a comma means a multi-range request.
+    if spec.contains(',') {
+        return RangeSpec::Ignore;
+    }
+
+    let (start_s, end_s) = match spec.split_once('-') {
+        Some(parts) => parts,
+        None => return RangeSpec::Ignore,
+    };
+    let start_s = start_s.trim();
+    let end_s = end_s.trim();
+
+    // An empty file can satisfy no range.
+    if len == 0 {
+        return RangeSpec::Unsatisfiable;
+    }
+
+    if start_s.is_empty() {
+        // Suffix form: `bytes=-N` => the final N bytes.
+        let suffix: u64 = match end_s.parse() {
+            Ok(n) => n,
+            Err(_) => return RangeSpec::Ignore,
+        };
+        if suffix == 0 {
+            return RangeSpec::Unsatisfiable;
+        }
+        let start = len.saturating_sub(suffix);
+        return RangeSpec::Satisfiable { start, end: len - 1 };
+    }
+
+    let start: u64 = match start_s.parse() {
+        Ok(n) => n,
+        Err(_) => return RangeSpec::Ignore,
+    };
+    if start >= len {
+        return RangeSpec::Unsatisfiable;
+    }
+
+    let end: u64 = if end_s.is_empty() {
+        len - 1
+    } else {
+        match end_s.parse::<u64>() {
+            Ok(n) => n.min(len - 1), // clamp to the last byte
+            Err(_) => return RangeSpec::Ignore,
+        }
+    };
+
+    if end < start {
+        return RangeSpec::Unsatisfiable;
+    }
+    RangeSpec::Satisfiable { start, end }
+}
+
+/// Read the inclusive byte range `[start, end]` from a file by seeking,
+/// so we never load the whole file just to serve a slice.
+fn read_slice(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut f = fs::File::open(path)?;
+    f.seek(SeekFrom::Start(start))?;
+    let count = (end - start + 1) as usize;
+    let mut buf = vec![0u8; count];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 fn directory_index_html(decoded_path: &str, fs_path: &Path) -> String {
