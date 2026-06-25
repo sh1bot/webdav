@@ -23,7 +23,10 @@ pub struct Auth {
 
 impl Auth {
     pub fn new(realm: String) -> Self {
-        Auth { realm, creds: HashMap::new() }
+        Auth {
+            realm,
+            creds: HashMap::new(),
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -77,7 +80,10 @@ impl Auth {
             Some(h) => h,
             None => return false,
         };
-        let encoded = match header.strip_prefix("Basic ").or_else(|| header.strip_prefix("basic ")) {
+        let encoded = match header
+            .strip_prefix("Basic ")
+            .or_else(|| header.strip_prefix("basic "))
+        {
             Some(e) => e.trim(),
             None => return false,
         };

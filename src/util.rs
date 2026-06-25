@@ -100,6 +100,15 @@ pub fn resolve_within(root: &Path, request_path: &str) -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// Append a trailing slash to `path` if it doesn't already have one.
+pub fn with_trailing_slash(path: &str) -> String {
+    if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/", path)
+    }
+}
+
 /// Very small extension -> MIME type table. Falls back to octet-stream.
 pub fn mime_for(path: &Path) -> &'static str {
     let ext = path
@@ -132,9 +141,13 @@ pub fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-/// Format a `SystemTime` as an HTTP-date (RFC 7231 / IMF-fixdate), e.g.
-/// `Tue, 15 Nov 1994 08:12:31 GMT`. Always in GMT.
-pub fn http_date(t: SystemTime) -> String {
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Decompose a `SystemTime` into UTC `(year, month, mday, hour, min, sec, wday)`,
+/// where `wday` is 0=Sunday. Shared by the date formatters.
+fn ymd_hms(t: SystemTime) -> (i64, i64, i64, i64, i64, i64, usize) {
     let secs = t
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -145,11 +158,14 @@ pub fn http_date(t: SystemTime) -> String {
     // 1970-01-01 was a Thursday (index 4 with Sunday = 0).
     let wday = ((days % 7) + 4).rem_euclid(7) as usize;
     let (year, month, mday) = civil_from_days(days);
+    (year, month, mday, hour, min, sec, wday)
+}
 
+/// Format a `SystemTime` as an HTTP-date (RFC 7231 / IMF-fixdate), e.g.
+/// `Tue, 15 Nov 1994 08:12:31 GMT`. Always in GMT.
+pub fn http_date(t: SystemTime) -> String {
+    let (year, month, mday, hour, min, sec, wday) = ymd_hms(t);
     const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     format!(
         "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
         WDAYS[wday],
@@ -165,18 +181,45 @@ pub fn http_date(t: SystemTime) -> String {
 /// Format a `SystemTime` as a compact UTC timestamp `YYYY-MM-DD HH:MM:SS`,
 /// suitable for a human-readable directory listing.
 pub fn datetime_utc(t: SystemTime) -> String {
-    let secs = t
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (year, month, mday) = civil_from_days(days);
+    let (year, month, mday, hour, min, sec, _) = ymd_hms(t);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         year, month, mday, hour, min, sec
     )
+}
+
+/// Parse an IMF-fixdate HTTP-date (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`) into
+/// seconds since the Unix epoch. Returns `None` if it isn't this exact form
+/// (the obsolete RFC 850 / asctime forms are not supported — modern clients
+/// send IMF-fixdate). Used for `If-Modified-Since` / `If-Range`.
+pub fn parse_http_date(s: &str) -> Option<i64> {
+    // "Sun, 06 Nov 1994 08:49:37 GMT" -> [wday] [day] [mon] [year] [hh:mm:ss] [GMT]
+    let mut it = s.split_whitespace();
+    let _wday = it.next()?;
+    let day: i64 = it.next()?.parse().ok()?;
+    let mon_name = it.next()?;
+    let year: i64 = it.next()?.parse().ok()?;
+    let time = it.next()?;
+
+    let month = MONTHS.iter().position(|&m| m == mon_name)? as i64 + 1;
+    let mut tp = time.split(':');
+    let h: i64 = tp.next()?.parse().ok()?;
+    let mi: i64 = tp.next()?.parse().ok()?;
+    let se: i64 = tp.next()?.parse().ok()?;
+
+    Some(days_from_civil(year, month, day) * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Inverse of `civil_from_days`: days since the Unix epoch for a civil date.
+/// Howard Hinnant's `days_from_civil` algorithm.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 /// Render a byte count compactly: plain bytes below 1 KiB, otherwise a single

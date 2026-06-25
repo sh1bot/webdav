@@ -1,9 +1,10 @@
-//! tiny-webdav: a single-threaded, read-only WebDAV server over TLS that
-//! requires clients to authenticate with a client certificate (mutual TLS).
+//! tiny-webdav: a single-threaded, read-only WebDAV server over TLS.
 //!
-//! "Private key sign-in" is implemented as mutual TLS: each client holds a
-//! private key + certificate signed by a CA we trust. The TLS handshake itself
-//! proves the client possesses the private key, so there are no passwords.
+//! Two optional, stackable authentication layers are available: client
+//! certificates (mutual TLS — "private key sign-in", where the TLS handshake
+//! proves the client holds a private key whose certificate we trust) and HTTP
+//! Basic username/password. Either, both, or (with a startup warning) neither
+//! can be required.
 
 mod auth;
 mod dav;
@@ -40,6 +41,7 @@ struct Args {
     realm: String,
     inetd: bool,
     log_file: Option<PathBuf>,
+    timeout: u64,
 }
 
 fn usage() -> ! {
@@ -50,7 +52,9 @@ fn usage() -> ! {
                        [--client-ca <ca.crt>] [--root <dir>] [--addr <host:port>]\n\n\
          OPTIONS:\n  \
            --root                  Directory to serve (default: current directory)\n  \
-           --addr                  Listen address (default: 127.0.0.1:4443)\n\n  \
+           --addr                  Listen address (default: 127.0.0.1:4443)\n  \
+           --timeout <secs>        Per-read/write socket timeout (default: 30, 0 to\n                          \
+                       disable; raise/disable for large transfers to slow links)\n\n  \
            Running under inetd/xinetd (one process per connection):\n  \
            --inetd                 Serve a single connection passed on stdin (fd 0),\n                          \
                        instead of binding/listening. Use the 'nowait' mode.\n  \
@@ -94,6 +98,7 @@ fn parse_args() -> Args {
     let mut realm = "tiny-webdav".to_string();
     let mut inetd = false;
     let mut log_file: Option<PathBuf> = None;
+    let mut timeout: u64 = 30;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -104,7 +109,9 @@ fn parse_args() -> Args {
             "--key" => key = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--self-signed" => self_signed = true,
             "--hostname" => hostnames.push(it.next().unwrap_or_else(|| usage())),
-            "--write-cert" => write_cert = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--write-cert" => {
+                write_cert = Some(PathBuf::from(it.next().unwrap_or_else(|| usage())))
+            }
             "--client-ca" => client_ca = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--client-cert-optional" => client_cert_optional = true,
             "--auth-file" => auth_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
@@ -113,6 +120,12 @@ fn parse_args() -> Args {
             "--realm" => realm = it.next().unwrap_or_else(|| usage()),
             "--inetd" => inetd = true,
             "--log-file" => log_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--timeout" => {
+                timeout = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage())
+            }
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("error: unexpected argument '{}'\n", other);
@@ -128,6 +141,13 @@ fn parse_args() -> Args {
 
     if client_cert_optional && client_ca.is_none() {
         eprintln!("error: --client-cert-optional requires --client-ca\n");
+        usage();
+    }
+
+    // A self-signed cert is regenerated per process; under inetd that's a new
+    // server identity for every connection. Refuse the combination.
+    if self_signed && inetd {
+        eprintln!("error: --self-signed cannot be combined with --inetd (use real --cert/--key)\n");
         usage();
     }
 
@@ -165,6 +185,7 @@ fn parse_args() -> Args {
         realm,
         inetd,
         log_file,
+        timeout,
     }
 }
 
@@ -203,26 +224,35 @@ fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
 
 /// Produce the server's certificate chain and private key, either by loading
 /// the supplied PEM files or by generating a fresh self-signed certificate.
-fn server_identity(args: &Args) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+fn server_identity(
+    args: &Args,
+) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     if args.self_signed {
         // Default SANs cover the common local-testing names.
         let sans = if args.hostnames.is_empty() {
-            vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()]
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string(),
+            ]
         } else {
             args.hostnames.clone()
         };
         let generated = rcgen::generate_simple_self_signed(sans.clone())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         if let Some(path) = &args.write_cert {
             std::fs::write(path, generated.cert.pem())?;
-            println!("wrote self-signed certificate to {}", path.display());
+            eprintln!("wrote self-signed certificate to {}", path.display());
         }
 
-        println!("using a generated self-signed certificate (SANs: {})", sans.join(", "));
+        eprintln!(
+            "using a generated self-signed certificate (SANs: {})",
+            sans.join(", ")
+        );
         let cert_der = generated.cert.der().clone();
         let key_der = PrivateKeyDer::try_from(generated.key_pair.serialize_der())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         Ok((vec![cert_der], key_der))
     } else {
         // Validated in parse_args: both are present here.
@@ -261,21 +291,26 @@ fn build_tls_config(args: &Args) -> io::Result<ServerConfig> {
         }
     };
 
-    with_certs.with_single_cert(server_certs, server_key).map_err(to_invalid)
+    with_certs
+        .with_single_cert(server_certs, server_key)
+        .map_err(to_invalid)
 }
 
 fn serve_connection(
     config: Arc<ServerConfig>,
     root: &Path,
     auth: &Auth,
+    timeout: u64,
     mut tcp: TcpStream,
 ) -> io::Result<()> {
-    // Bound how long a single (single-threaded!) connection can stall us.
-    tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+    // Bound how long a single (single-threaded!) blocking I/O can stall us.
+    // `--timeout 0` disables it (needed for large transfers to slow links,
+    // since this is a per-operation timeout, not an idle timeout).
+    let to = (timeout != 0).then(|| Duration::from_secs(timeout));
+    tcp.set_read_timeout(to)?;
+    tcp.set_write_timeout(to)?;
 
-    let mut conn = ServerConnection::new(config)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let mut conn = ServerConnection::new(config).map_err(|e| io::Error::other(e.to_string()))?;
 
     {
         // rustls::Stream drives the TLS handshake transparently on first I/O.
@@ -292,7 +327,7 @@ fn serve_connection(
 
 /// Serve the single connection inetd handed us on stdin (fd 0), then return.
 #[cfg(unix)]
-fn serve_inetd(config: Arc<ServerConfig>, root: &Path, auth: &Auth) {
+fn serve_inetd(config: Arc<ServerConfig>, root: &Path, auth: &Auth, timeout: u64) {
     use std::os::unix::io::FromRawFd;
 
     // Safety: under inetd, fd 0 is the connected, owned TCP socket. We take
@@ -302,13 +337,13 @@ fn serve_inetd(config: Arc<ServerConfig>, root: &Path, auth: &Auth) {
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "?".to_string());
-    if let Err(e) = serve_connection(config, root, auth, sock) {
+    if let Err(e) = serve_connection(config, root, auth, timeout, sock) {
         eprintln!("[{}] connection error: {}", peer, e);
     }
 }
 
 #[cfg(not(unix))]
-fn serve_inetd(_config: Arc<ServerConfig>, _root: &Path, _auth: &Auth) {
+fn serve_inetd(_config: Arc<ServerConfig>, _root: &Path, _auth: &Auth, _timeout: u64) {
     eprintln!("error: --inetd is only supported on Unix platforms");
     process::exit(1);
 }
@@ -322,29 +357,23 @@ fn protect_inetd_streams(log_file: Option<&Path>) {
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
 
-    let devnull = OpenOptions::new().write(true).open("/dev/null");
-    if let Ok(n) = &devnull {
-        unsafe { libc::dup2(n.as_raw_fd(), 1) };
-    }
+    // /dev/null must open: if it doesn't, fd 1 would stay pointed at the client
+    // socket and any later output would corrupt the TLS stream. Fail closed —
+    // and silently, since stderr may itself still be the socket.
+    let devnull = match OpenOptions::new().write(true).open("/dev/null") {
+        Ok(f) => f,
+        Err(_) => process::exit(1),
+    };
+    unsafe { libc::dup2(devnull.as_raw_fd(), 1) };
 
     // stderr: a log file if requested and openable, otherwise /dev/null.
-    let logged = log_file.and_then(|p| {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)
-            .ok()
-            .map(|f| {
-                unsafe { libc::dup2(f.as_raw_fd(), 2) };
-                f
-            })
-    });
-    if logged.is_none() {
-        if let Ok(n) = &devnull {
-            unsafe { libc::dup2(n.as_raw_fd(), 2) };
-        }
-    }
-    // `devnull`/`logged` File handles drop here, closing their original fds;
+    let log = log_file.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
+    let stderr_fd = log
+        .as_ref()
+        .map(|f| f.as_raw_fd())
+        .unwrap_or(devnull.as_raw_fd());
+    unsafe { libc::dup2(stderr_fd, 2) };
+    // `devnull`/`log` File handles drop here, closing their original fds;
     // the dup2'd descriptors 1 and 2 remain valid.
 }
 
@@ -377,7 +406,10 @@ fn main() {
         }
     };
     if !canonical_root.is_dir() {
-        eprintln!("error: --root {} is not a directory", canonical_root.display());
+        eprintln!(
+            "error: --root {} is not a directory",
+            canonical_root.display()
+        );
         process::exit(1);
     }
 
@@ -397,12 +429,23 @@ fn main() {
         }
     };
 
+    let cert_required = args.client_ca.is_some() && !args.client_cert_optional;
+
+    // Warn (in BOTH modes, on stderr so it reaches an inetd --log-file) when the
+    // server requires no authentication at all.
+    if !cert_required && !auth.is_enabled() {
+        eprintln!(
+            "WARNING: no client-cert requirement and no password — \
+             anyone who can reach this server can read the served files."
+        );
+    }
+
     // inetd mode: there is no listener. inetd has already accepted the
     // connection and handed us the socket on stdin. Confine the process, serve
     // that one connection, and exit so inetd can fork the next one.
     if args.inetd {
         let serve_root = lower_privileges(&canonical_root);
-        serve_inetd(config, &serve_root, &auth);
+        serve_inetd(config, &serve_root, &auth, args.timeout);
         return;
     }
 
@@ -414,7 +457,6 @@ fn main() {
         }
     };
 
-    let cert_required = args.client_ca.is_some() && !args.client_cert_optional;
     let cert_mode = match (&args.client_ca, args.client_cert_optional) {
         (None, _) => "disabled",
         (Some(_), false) => "REQUIRED",
@@ -433,12 +475,6 @@ fn main() {
     } else {
         println!("HTTP Basic authentication: disabled");
     }
-    if !cert_required && !auth.is_enabled() {
-        println!(
-            "WARNING: no client-cert requirement and no password — \
-             anyone who can reach this port can read the served files."
-        );
-    }
 
     // Everything that needs the filesystem or privileged ports is done (certs
     // and credentials are in memory, the socket is bound). Now confine the
@@ -455,7 +491,9 @@ fn main() {
                     .peer_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "?".to_string());
-                if let Err(e) = serve_connection(config.clone(), &serve_root, &auth, tcp) {
+                if let Err(e) =
+                    serve_connection(config.clone(), &serve_root, &auth, args.timeout, tcp)
+                {
                     // A failed/rejected client handshake lands here too; log briefly.
                     eprintln!("[{}] connection error: {}", peer, e);
                 }
@@ -495,11 +533,12 @@ fn lower_privileges(root: &Path) -> PathBuf {
     let mut serve_root = root.to_path_buf();
 
     // chroot into the served directory, then make it the working directory.
+    // chroot itself is best-effort (we still drop privileges below if it fails).
     match CString::new(root.as_os_str().as_bytes()) {
         Ok(c_root) => unsafe {
             if libc::chroot(c_root.as_ptr()) == 0 && libc::chdir(c"/".as_ptr()) == 0 {
                 serve_root = PathBuf::from("/");
-                println!("chroot: confined to {}", root.display());
+                eprintln!("chroot: confined to {}", root.display());
             } else {
                 eprintln!(
                     "chroot to {} failed ({}); carrying on without chroot",
@@ -512,27 +551,30 @@ fn lower_privileges(root: &Path) -> PathBuf {
     }
 
     // Drop supplementary groups, then gid, then uid (must be in this order).
+    // We are root here, so failing to drop is a hard security failure (we'd keep
+    // serving with root privileges) — treat it as fatal rather than carrying on.
     unsafe {
         if libc::setgroups(0, std::ptr::null()) != 0 {
             eprintln!("setgroups failed ({})", io::Error::last_os_error());
         }
         if libc::setgid(gid) != 0 {
             eprintln!(
-                "setgid({}) failed ({}); carrying on as current group",
+                "fatal: setgid({}) failed ({})",
                 gid,
                 io::Error::last_os_error()
             );
+            process::exit(1);
         }
         if libc::setuid(uid) != 0 {
             eprintln!(
-                "setuid({}) failed ({}); carrying on as current user",
+                "fatal: setuid({}) failed ({})",
                 uid,
                 io::Error::last_os_error()
             );
-        } else {
-            println!("dropped privileges to nobody (uid={}, gid={})", uid, gid);
+            process::exit(1);
         }
     }
+    eprintln!("dropped privileges to nobody (uid={}, gid={})", uid, gid);
 
     serve_root
 }

@@ -26,9 +26,16 @@ read access and prints a warning at startup.
   - `GET` / `HEAD` (files; directories return an HTML index listing each
     entry's name, last-modified time in UTC, and size)
   - `PROPFIND` (`Depth: 0` and `Depth: 1`) returning `207 Multi-Status`
+    (a `Depth: infinity` request gets `403` with `DAV:propfind-finite-depth`
+    so clients fall back to walking the tree one level at a time)
+- Conditional requests: every file response carries an `ETag` and
+  `Last-Modified`, and `If-None-Match` / `If-Modified-Since` are honoured with
+  `304 Not Modified` so clients can revalidate cheaply.
 - HTTP `Range` requests (single `bytes=` ranges) for partial/resumable
   downloads: responds `206 Partial Content` with `Content-Range`, `416` for
-  unsatisfiable ranges, and advertises `Accept-Ranges: bytes`.
+  unsatisfiable ranges, and advertises `Accept-Ranges: bytes`. `If-Range` is
+  honoured, so a resumed download whose file changed restarts cleanly instead
+  of splicing two versions.
 - File bodies are streamed in 64 KiB chunks (seeking for ranges), so even
   multi-gigabyte files are served with near-constant memory — the whole file
   is never read into RAM.
@@ -104,8 +111,9 @@ into `certs/`.
 | `--write-cert`           | Write the generated self-signed cert (PEM) to this path           | *(none)*           |
 | `--root`                 | Directory to serve (read-only)                                    | current directory  |
 | `--addr`                 | Listen address                                                    | `127.0.0.1:4443`   |
+| `--timeout`              | Per-read/write socket timeout in seconds (`0` disables — raise or disable for large transfers over slow links) | `30` |
 | `--client-ca`            | PEM CA used to verify **client** certificates. Omit to disable client-cert auth. | *(none → disabled)* |
-| `--client-cert-optional` | Accept clients without a cert, but verify any cert presented (needs `--client-ca`) | required           |
+| `--client-cert-optional` | Accept clients without a cert, but verify any cert presented (needs `--client-ca`) | off |
 | `--auth-file`            | File of `username:password` lines (`#` comments allowed)          | *(none)*           |
 | `--user`                 | A single username (use together with `--password`)                | *(none)*           |
 | `--password`             | Password for `--user`                                             | *(none)*           |
@@ -171,8 +179,12 @@ Notes for inetd mode:
   Use `--log-file <path>` to capture diagnostics; otherwise they go to
   `/dev/null`.
 - `--addr` is ignored in `--inetd` mode (inetd owns the listening socket).
-- Prefer real `--cert`/`--key` files here; `--self-signed` would generate a new
-  certificate for every connection.
+- Use real `--cert`/`--key` files here; `--self-signed` is rejected in `--inetd`
+  mode (it would generate a new certificate for every connection).
+- The per-connection process still chroots and drops to `nobody` — but only if
+  inetd starts it **as root**. If the inetd line runs it as `nobody` (as the
+  examples above do), it's already unprivileged, so chroot is skipped; run it as
+  `root` in the inetd config if you want the chroot confinement.
 - `--inetd` is Unix-only.
 
 ### Username/password auth
@@ -244,18 +256,28 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
   read-only use behind client-certificate auth — not as a public, high-traffic
   fileserver.
 - It is single-threaded: one connection is fully handled before the next is
-  accepted. A read/write timeout (30s) bounds how long a slow client can stall
-  the loop, but a hostile client can still reduce throughput.
-- Symlinks under `--root` are followed; don't place symlinks that point outside
-  the served tree if that matters to you.
+  accepted. A per-operation read/write timeout (`--timeout`, default 30s) bounds
+  how long a slow client can stall the loop, but a hostile client can still
+  reduce throughput. Because it is per-operation rather than idle-based, a
+  genuinely slow link pulling a very large file can trip it — raise `--timeout`
+  or set it to `0` for those cases. For concurrency across clients, run under
+  inetd (see above).
+- **"Read-only" means no client request can modify the served tree** (there is
+  no PUT/DELETE/etc.). The process itself may write two operator-specified files,
+  before any privilege drop: `--write-cert` and `--log-file`.
+- Symlinks under `--root` are followed, but a symlink whose target resolves
+  *outside* the served root is refused (`403`) and omitted from listings, so it
+  can't be used to escape the root. (After a successful `chroot` this is moot —
+  nothing outside the root exists.)
 - **Privilege dropping:** once all setup is done (certificates and credentials
   loaded into memory, listening socket bound), the process tries to `chroot`
   into the served directory and drop to the `nobody` user/group. After a
-  successful `chroot` the served directory becomes `/`, so nothing outside it is
-  reachable even via symlinks. This requires starting as root (e.g. to also bind
-  a privileged port); if the process isn't privileged enough, it prints a note
-  to stderr and carries on without confining itself. For the dropped `nobody`
-  user to actually read the files, they must be readable by that account.
+  successful `chroot` the served directory becomes `/`. This requires starting as
+  root (e.g. to also bind a privileged port). If the process isn't running as
+  root it prints a note to stderr and carries on unconfined; but if it *is* root
+  and the `setgid`/`setuid` drop fails, that is fatal (it will not keep serving
+  with root privileges). For the dropped `nobody` user to read the files, they
+  must be readable by that account.
 - The example certificates from `gen-certs.sh` are for testing only. Use your
   own PKI in production and keep private keys readable only by their owner.
 ```

@@ -4,10 +4,14 @@
 //! never have to worry about keep-alive framing.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{self, Read, Write};
+use std::time::SystemTime;
+
+use crate::util;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_BODY_BYTES: usize = 1 * 1024 * 1024; // PROPFIND bodies are tiny.
+const MAX_BODY_BYTES: usize = 1024 * 1024; // PROPFIND bodies are tiny.
 
 pub struct Request {
     pub method: String,
@@ -83,7 +87,10 @@ pub fn read_request<S: Read>(stream: &mut S) -> io::Result<Request> {
     }
 
     // Drain request body if present so the socket is clean.
-    if let Some(len) = headers.get("content-length").and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(len) = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         let to_read = len.min(MAX_BODY_BYTES);
         let mut remaining = to_read;
         let mut sink = [0u8; 4096];
@@ -97,7 +104,11 @@ pub fn read_request<S: Read>(stream: &mut S) -> io::Result<Request> {
         }
     }
 
-    Ok(Request { method, path, headers })
+    Ok(Request {
+        method,
+        path,
+        headers,
+    })
 }
 
 /// Write a complete response with the given status, extra headers and body.
@@ -112,7 +123,14 @@ pub fn write_response<S: Write>(
     body: &[u8],
     send_body: bool,
 ) -> io::Result<()> {
-    write_head(stream, status, reason, content_type, extra_headers, body.len() as u64)?;
+    write_head(
+        stream,
+        status,
+        reason,
+        content_type,
+        extra_headers,
+        body.len() as u64,
+    )?;
     if send_body {
         stream.write_all(body)?;
     }
@@ -132,14 +150,15 @@ pub fn write_head<S: Write>(
     content_length: u64,
 ) -> io::Result<()> {
     let mut head = String::new();
-    head.push_str(&format!("HTTP/1.1 {} {}\r\n", status, reason));
-    head.push_str(&format!("Content-Length: {}\r\n", content_length));
+    let _ = write!(head, "HTTP/1.1 {} {}\r\n", status, reason);
+    let _ = write!(head, "Content-Length: {}\r\n", content_length);
     if !content_type.is_empty() {
-        head.push_str(&format!("Content-Type: {}\r\n", content_type));
+        let _ = write!(head, "Content-Type: {}\r\n", content_type);
     }
     for (k, v) in extra_headers {
-        head.push_str(&format!("{}: {}\r\n", k, v));
+        let _ = write!(head, "{}: {}\r\n", k, v);
     }
+    let _ = write!(head, "Date: {}\r\n", util::http_date(SystemTime::now()));
     head.push_str("Server: tiny-webdav\r\n");
     head.push_str("Connection: close\r\n");
     head.push_str("\r\n");

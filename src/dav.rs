@@ -5,7 +5,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::Auth;
 use crate::http::{self, Request};
@@ -33,8 +33,8 @@ pub fn handle<S: Read + Write>(
 
     match req.method.as_str() {
         "OPTIONS" => options(stream),
-        "GET" => get_or_head(stream, &decoded, &fs_path, req, true),
-        "HEAD" => get_or_head(stream, &decoded, &fs_path, req, false),
+        "GET" => get_or_head(stream, root, &decoded, &fs_path, req, true),
+        "HEAD" => get_or_head(stream, root, &decoded, &fs_path, req, false),
         "PROPFIND" => propfind(stream, root, &decoded, &fs_path, req),
         // Read-only: reject every mutating / unsupported method.
         _ => http::write_response(
@@ -67,6 +67,7 @@ fn options<S: Write>(stream: &mut S) -> io::Result<()> {
 
 fn get_or_head<S: Write>(
     stream: &mut S,
+    root: &Path,
     decoded_path: &str,
     fs_path: &Path,
     req: &Request,
@@ -74,12 +75,16 @@ fn get_or_head<S: Write>(
 ) -> io::Result<()> {
     let meta = match fs::metadata(fs_path) {
         Ok(m) => m,
-        Err(_) => return http::write_status(stream, 404, "Not Found"),
+        Err(e) => return err_status(stream, &e),
     };
+    // Reject anything (e.g. a symlink target) that resolves outside the root.
+    if !within_root(root, fs_path) {
+        return http::write_status(stream, 403, "Forbidden");
+    }
 
     if meta.is_dir() {
         // GET on a collection returns a simple HTML index for browsers.
-        let html = directory_index_html(decoded_path, fs_path);
+        let html = directory_index_html(root, decoded_path, fs_path);
         return http::write_response(
             stream,
             200,
@@ -92,24 +97,57 @@ fn get_or_head<S: Write>(
     }
 
     let len = meta.len();
+    let modified = meta.modified().ok();
+    let etag = etag_for(&meta);
+
+    // Conditional GET: If-None-Match / If-Modified-Since => 304 Not Modified.
+    if not_modified(req, etag.as_deref(), modified) {
+        let mut h: Vec<(&str, String)> = Vec::new();
+        if let Some(e) = &etag {
+            h.push(("ETag", e.clone()));
+        }
+        if let Some(m) = modified {
+            h.push(("Last-Modified", util::http_date(m)));
+        }
+        return http::write_response(stream, 304, "Not Modified", "", &h, b"", false);
+    }
+
     let mut headers: Vec<(&str, String)> = Vec::new();
-    if let Ok(modified) = meta.modified() {
-        headers.push(("Last-Modified", util::http_date(modified)));
+    if let Some(m) = modified {
+        headers.push(("Last-Modified", util::http_date(m)));
+    }
+    if let Some(e) = &etag {
+        headers.push(("ETag", e.clone()));
     }
     // We honour single byte ranges; advertise that to clients.
     headers.push(("Accept-Ranges", "bytes".to_string()));
 
     let content_type = util::mime_for(fs_path);
 
-    match req.header("range").map(|r| parse_byte_range(r, len)) {
+    // Honour Range only when there's no If-Range or its validator still matches;
+    // otherwise serve the full entity (so a resumed download can't splice bytes
+    // from two different versions of a file).
+    let range = req.header("range");
+    let spec = match range {
+        Some(r) if if_range_matches(req, etag.as_deref(), modified) => parse_byte_range(r, len),
+        _ => RangeSpec::Ignore,
+    };
+
+    match spec {
         // A range was requested and it is satisfiable: 206 Partial Content.
-        Some(RangeSpec::Satisfiable { start, end }) => {
+        RangeSpec::Satisfiable { start, end } => {
             let count = end - start + 1;
             headers.push(("Content-Range", format!("bytes {}-{}/{}", start, end, len)));
-            stream_file(stream, fs_path, start, count, 206, "Partial Content", content_type, &headers, send_body)
+            let resp = Resp {
+                status: 206,
+                reason: "Partial Content",
+                content_type,
+                headers: &headers,
+            };
+            stream_file(stream, fs_path, start, count, &resp, send_body)
         }
         // A range was requested but cannot be satisfied: 416.
-        Some(RangeSpec::Unsatisfiable) => http::write_response(
+        RangeSpec::Unsatisfiable => http::write_response(
             stream,
             416,
             "Range Not Satisfiable",
@@ -119,23 +157,35 @@ fn get_or_head<S: Write>(
             true,
         ),
         // No usable Range header: serve the whole file (200).
-        _ => stream_file(stream, fs_path, 0, len, 200, "OK", content_type, &headers, send_body),
+        RangeSpec::Ignore => {
+            let resp = Resp {
+                status: 200,
+                reason: "OK",
+                content_type,
+                headers: &headers,
+            };
+            stream_file(stream, fs_path, 0, len, &resp, send_body)
+        }
     }
+}
+
+/// The status line + headers for a streamed file response.
+struct Resp<'a> {
+    status: u16,
+    reason: &'a str,
+    content_type: &'a str,
+    headers: &'a [(&'a str, String)],
 }
 
 /// Stream `count` bytes of a file starting at byte `offset` as the response
 /// body, after writing the status line and headers. The file is read in
 /// chunks (see [`http::stream_body`]) so large files never sit in memory.
-#[allow(clippy::too_many_arguments)]
 fn stream_file<S: Write>(
     stream: &mut S,
     fs_path: &Path,
     offset: u64,
     count: u64,
-    status: u16,
-    reason: &str,
-    content_type: &str,
-    headers: &[(&str, String)],
+    resp: &Resp,
     send_body: bool,
 ) -> io::Result<()> {
     use std::io::{Seek as _, SeekFrom};
@@ -144,19 +194,101 @@ fn stream_file<S: Write>(
     // reported as an error response rather than a truncated body.
     let mut file = match fs::File::open(fs_path) {
         Ok(f) => f,
-        Err(_) => return http::write_status(stream, 404, "Not Found"),
+        Err(e) => return err_status(stream, &e),
     };
     if offset != 0 && file.seek(SeekFrom::Start(offset)).is_err() {
         return http::write_status(stream, 500, "Internal Server Error");
     }
 
-    http::write_head(stream, status, reason, content_type, headers, count)?;
+    http::write_head(
+        stream,
+        resp.status,
+        resp.reason,
+        resp.content_type,
+        resp.headers,
+        count,
+    )?;
     if send_body {
         http::stream_body(&mut file, stream, count)?;
     } else {
         stream.flush()?;
     }
     Ok(())
+}
+
+/// Map a filesystem error to the appropriate HTTP status response.
+fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
+    match e.kind() {
+        io::ErrorKind::NotFound => http::write_status(stream, 404, "Not Found"),
+        io::ErrorKind::PermissionDenied => http::write_status(stream, 403, "Forbidden"),
+        _ => http::write_status(stream, 500, "Internal Server Error"),
+    }
+}
+
+/// True if `fs_path`, fully resolved (following symlinks), is still inside
+/// `root`. When the server has chrooted, `root` is `/` and this is always true;
+/// otherwise it stops a symlink under the served tree from escaping it.
+fn within_root(root: &Path, fs_path: &Path) -> bool {
+    match fs_path.canonicalize() {
+        Ok(real) => real.starts_with(root),
+        Err(_) => false,
+    }
+}
+
+/// A strong validator built from size and mtime, e.g. `"1f-65a3b2c0"`.
+fn etag_for(meta: &fs::Metadata) -> Option<String> {
+    let secs = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(format!("\"{:x}-{:x}\"", meta.len(), secs))
+}
+
+/// Does an `If-None-Match` entry list match our ETag (or is it `*`)?
+fn etag_list_matches(header: &str, etag: &str) -> bool {
+    let h = header.trim();
+    h == "*"
+        || h.split(',')
+            .map(|t| t.trim().trim_start_matches("W/"))
+            .any(|t| t == etag)
+}
+
+/// Evaluate conditional-GET preconditions. Returns true when the client's
+/// cached copy is still current and we should answer `304 Not Modified`.
+/// `If-None-Match` takes precedence over `If-Modified-Since` (RFC 7232).
+fn not_modified(req: &Request, etag: Option<&str>, modified: Option<SystemTime>) -> bool {
+    if let Some(inm) = req.header("if-none-match") {
+        return etag.map(|e| etag_list_matches(inm, e)).unwrap_or(false);
+    }
+    if let (Some(ims), Some(m)) = (req.header("if-modified-since"), modified) {
+        if let (Some(since), Ok(mtime)) = (
+            util::parse_http_date(ims),
+            m.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64),
+        ) {
+            return mtime <= since;
+        }
+    }
+    false
+}
+
+/// For a ranged request, decide whether the `If-Range` validator still matches
+/// (so the range is safe to serve). No `If-Range` header => always matches.
+fn if_range_matches(req: &Request, etag: Option<&str>, modified: Option<SystemTime>) -> bool {
+    let ir = match req.header("if-range") {
+        Some(v) => v.trim(),
+        None => return true,
+    };
+    if ir.starts_with('"') {
+        return etag == Some(ir);
+    }
+    if let (Some(since), Some(m)) = (util::parse_http_date(ir), modified) {
+        if let Ok(mtime) = m.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64) {
+            return mtime <= since;
+        }
+    }
+    false
 }
 
 /// The outcome of interpreting a `Range` header against a known content length.
@@ -209,7 +341,10 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
             return RangeSpec::Unsatisfiable;
         }
         let start = len.saturating_sub(suffix);
-        return RangeSpec::Satisfiable { start, end: len - 1 };
+        return RangeSpec::Satisfiable {
+            start,
+            end: len - 1,
+        };
     }
 
     let start: u64 = match start_s.parse() {
@@ -244,10 +379,14 @@ struct IndexEntry {
     len: u64,
 }
 
-fn directory_index_html(decoded_path: &str, fs_path: &Path) -> String {
+fn directory_index_html(root: &Path, decoded_path: &str, fs_path: &Path) -> String {
     let mut entries: Vec<IndexEntry> = Vec::new();
     if let Ok(rd) = fs::read_dir(fs_path) {
         for e in rd.flatten() {
+            // Don't list entries (e.g. symlinks) that resolve outside the root.
+            if !within_root(root, &e.path()) {
+                continue;
+            }
             // Follow symlinks so size/date match what GET would actually serve.
             // Fall back to the entry's own type if the target can't be stat'd.
             let md = fs::metadata(e.path()).ok();
@@ -267,11 +406,7 @@ fn directory_index_html(decoded_path: &str, fs_path: &Path) -> String {
     // Directories first, then alphabetical.
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
 
-    let base = if decoded_path.ends_with('/') {
-        decoded_path.to_string()
-    } else {
-        format!("{}/", decoded_path)
-    };
+    let base = util::with_trailing_slash(decoded_path);
     let title = util::xml_escape(decoded_path);
 
     let mut html = String::new();
@@ -319,19 +454,36 @@ fn directory_index_html(decoded_path: &str, fs_path: &Path) -> String {
 
 fn propfind<S: Write>(
     stream: &mut S,
-    _root: &Path,
+    root: &Path,
     decoded_path: &str,
     fs_path: &Path,
     req: &Request,
 ) -> io::Result<()> {
     let meta = match fs::metadata(fs_path) {
         Ok(m) => m,
-        Err(_) => return http::write_status(stream, 404, "Not Found"),
+        Err(e) => return err_status(stream, &e),
     };
+    if !within_root(root, fs_path) {
+        return http::write_status(stream, 403, "Forbidden");
+    }
 
     // Depth: 0 => just this resource; 1 => this resource + immediate children.
-    // "infinity" is treated as 1 to stay simple and bounded.
     let depth = req.header("depth").unwrap_or("1").trim();
+    // We don't crawl recursively; tell an "infinity" client to walk per-level
+    // instead of silently returning only one level as if it were the whole tree.
+    if depth.eq_ignore_ascii_case("infinity") {
+        let body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <D:error xmlns:D=\"DAV:\"><D:propfind-finite-depth/></D:error>\n";
+        return http::write_response(
+            stream,
+            403,
+            "Forbidden",
+            "application/xml; charset=utf-8",
+            &[],
+            body.as_bytes(),
+            true,
+        );
+    }
     let include_children = depth != "0";
 
     let mut xml = String::new();
@@ -343,17 +495,21 @@ fn propfind<S: Write>(
 
     // Immediate children, if this is a collection and depth allows it.
     if meta.is_dir() && include_children {
-        let base = if decoded_path.ends_with('/') {
-            decoded_path.to_string()
-        } else {
-            format!("{}/", decoded_path)
-        };
+        let base = util::with_trailing_slash(decoded_path);
         if let Ok(rd) = fs::read_dir(fs_path) {
             for entry in rd.flatten() {
-                if let Ok(child_meta) = entry.metadata() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let child_path = format!("{}{}", base, name);
-                    xml.push_str(&response_xml(&child_path, &child_meta, &entry.path()));
+                let path = entry.path();
+                // Skip children that resolve outside the root (escaping symlinks).
+                if !within_root(root, &path) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let child_path = format!("{}{}", base, name);
+                // Follow symlinks (matching GET); list un-stattable entries with
+                // a 404 propstat rather than dropping them from the listing.
+                match fs::metadata(&path) {
+                    Ok(child_meta) => xml.push_str(&response_xml(&child_path, &child_meta, &path)),
+                    Err(_) => xml.push_str(&response_failed_xml(&child_path)),
                 }
             }
         }
@@ -424,4 +580,14 @@ fn response_xml(href_path: &str, meta: &fs::Metadata, fs_path: &Path) -> String 
     block.push_str("    </D:propstat>\n");
     block.push_str("  </D:response>\n");
     block
+}
+
+/// A `<D:response>` for an entry whose metadata couldn't be read: list the
+/// href with a 404 status so the client sees a complete (if partial) listing.
+fn response_failed_xml(href_path: &str) -> String {
+    format!(
+        "  <D:response>\n    <D:href>{}</D:href>\n    \
+         <D:status>HTTP/1.1 404 Not Found</D:status>\n  </D:response>\n",
+        util::percent_encode_path(href_path)
+    )
 }
