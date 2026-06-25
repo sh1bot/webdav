@@ -1,22 +1,26 @@
 # tiny-webdav
 
-A very small, **single-threaded, read-only** WebDAV server written in Rust, with
-**TLS client-certificate authentication** (mutual TLS).
+A very small, **read-only** WebDAV server written in Rust, served over TLS and
+run under **inetd / xinetd**. There is no standalone listening mode: xinetd (in
+`nowait` mode) accepts each connection and hands the socket to a fresh process
+on stdin; tiny-webdav performs the TLS handshake itself, serves the one request,
+and exits. That gives per-connection concurrency (one process per client) for
+free, and keeps the program tiny.
 
 Two independent authentication layers are available, and you can use either or
 both:
 
 1. **Client certificate ("private key sign-in" / mutual TLS).** Each client
    holds a private key + certificate signed by a CA the server trusts, and the
-   TLS handshake itself proves the client possesses that private key. This is a
-   native feature of TLS/HTTPS. It can be **required**, **optional** (verify a
-   cert if presented, but also accept clients without one), or **disabled**.
+   TLS handshake itself proves the client possesses that private key. It can be
+   **required**, **optional** (verify a cert if presented, but also accept
+   clients without one), or **disabled**.
 2. **HTTP Basic username/password.** Safe here because the whole connection is
    already encrypted by TLS.
 
 When both are configured, a request must satisfy **both** the client certificate
 **and** valid credentials. If you configure neither, the server allows anonymous
-read access and prints a warning at startup.
+read access and logs a warning.
 
 ## Features
 
@@ -37,48 +41,22 @@ read access and prints a warning at startup.
   honoured, so a resumed download whose file changed restarts cleanly instead
   of splicing two versions.
 - File bodies are streamed in 64 KiB chunks (seeking for ranges), so even
-  multi-gigabyte files are served with near-constant memory — the whole file
-  is never read into RAM.
+  multi-gigabyte files are served with near-constant memory.
 - Every mutating method (`PUT`, `DELETE`, `MKCOL`, `MOVE`, `COPY`,
   `PROPPATCH`, `LOCK`, …) is rejected with `405 Method Not Allowed`.
-- Bring your own server certificate, or generate a self-signed one on the fly
-  with `--self-signed` (handy for quick local testing).
-- Runs standalone (binds its own port) or under inetd/xinetd `nowait` with
-  `--inetd` (one process per connection, for concurrency).
-- Client-certificate auth that can be required, optional, or disabled.
-- Optional HTTP Basic username/password auth, layered on top of any
-  client-certificate auth (`401` challenge with `WWW-Authenticate` when
-  missing/invalid).
-- Rejects path traversal (`..`) so only files under `--root` are reachable.
-- Tiny dependency footprint: just `rustls` (with the `ring` provider) and
-  `rustls-pemfile`. No async runtime, no HTTP framework.
+- Client-certificate auth that can be required, optional, or disabled, plus
+  optional HTTP Basic username/password (`401` challenge with `WWW-Authenticate`
+  when missing/invalid).
+- Rejects path traversal (`..`) and symlink escapes, so only files under
+  `--root` are reachable. Optionally `chroot`s and drops to `nobody` after setup.
+- Tiny dependency footprint: just `rustls` (with the `ring` provider),
+  `rustls-pemfile`, and `libc`. No async runtime, no HTTP framework.
 
 ## Build
 
 ```sh
 cargo build --release
 ```
-
-## Quick start with a self-signed certificate
-
-For local testing you don't need to create a server certificate at all — let the
-server generate one and write it out so your client can trust it:
-
-```sh
-./target/release/tiny-webdav \
-  --self-signed --write-cert /tmp/srv.pem \
-  --root ./served --user alice --password s3cret
-
-# in another terminal:
-curl --cacert /tmp/srv.pem -u alice:s3cret https://localhost:4443/
-# ...or skip trust entirely for throwaway testing:
-curl -k -u alice:s3cret https://localhost:4443/
-```
-
-Add `--hostname <name>` (repeatable) if you need the certificate to be valid for
-names other than `localhost`/`127.0.0.1`/`::1`. A self-signed server certificate
-is fine for testing, but clients can't verify it against a public CA, so use a
-real certificate (or your own CA) for anything beyond local use.
 
 ## Generate test certificates
 
@@ -91,27 +69,15 @@ A helper script creates a throwaway CA plus a server and a client certificate:
 This writes `ca.crt`, `server.crt`/`server.key` and `client.crt`/`client.key`
 into `certs/`.
 
-## Run
-
-```sh
-./target/release/tiny-webdav \
-  --cert      certs/server.crt \
-  --key       certs/server.key \
-  --client-ca certs/ca.crt \
-  --root      ./served \
-  --addr      127.0.0.1:4443
-```
+## Options
 
 | Flag                     | Meaning                                                            | Default            |
 |--------------------------|-------------------------------------------------------------------|--------------------|
-| `--cert`                 | PEM server certificate (chain) presented to clients               | *(required unless `--self-signed`)* |
-| `--key`                  | PEM server private key                                            | *(required unless `--self-signed`)* |
-| `--self-signed`          | Generate an in-memory self-signed server cert (testing)           | off                |
-| `--hostname`             | SAN for the self-signed cert; repeatable                          | `localhost`, `127.0.0.1`, `::1` |
-| `--write-cert`           | Write the generated self-signed cert (PEM) to this path           | *(none)*           |
+| `--cert`                 | PEM server certificate (chain) presented to clients               | *(required)*       |
+| `--key`                  | PEM server private key                                            | *(required)*       |
 | `--root`                 | Directory to serve (read-only)                                    | current directory  |
-| `--addr`                 | Listen address                                                    | `127.0.0.1:4443`   |
 | `--timeout`              | Per-read/write socket timeout in seconds (`0` disables — raise or disable for large transfers over slow links) | `30` |
+| `--log-file`             | Send diagnostics here (stdout/stderr are the client socket, so they are otherwise discarded) | *(none → `/dev/null`)* |
 | `--client-ca`            | PEM CA used to verify **client** certificates. Omit to disable client-cert auth. | *(none → disabled)* |
 | `--client-cert-optional` | Accept clients without a cert, but verify any cert presented (needs `--client-ca`) | off |
 | `--auth-file`            | File of `username:password` lines (`#` comments allowed)          | *(none)*           |
@@ -127,34 +93,23 @@ into `certs/`.
 | Username/password only (no client cert)| *(omit `--client-ca`)* `--auth-file users.txt`              |
 | Either works, but a login is always required | `--client-ca ca.crt --client-cert-optional --auth-file users.txt` |
 | Cert **and** password both required    | `--client-ca ca.crt --auth-file users.txt`                  |
-| Anonymous read access (no auth)        | *(omit both — prints a warning)*                            |
+| Anonymous read access (no auth)        | *(omit both — logs a warning)*                              |
 
-If no credentials are configured, Basic auth is disabled. If `--client-ca` is
-omitted, client-certificate auth is disabled. With both disabled the server
-serves anyone who can reach it (and says so at startup).
+`username:password` lines look like this (the password may itself contain `:`):
+
+```
+# users.txt
+alice:s3cret
+bob:p@ss:word
+```
 
 ## Running under inetd / xinetd
 
-By default the server binds a port and accepts connections itself (one at a
-time, single-threaded). Alternatively you can let **inetd**/**xinetd** own the
-listening socket and spawn one process per connection — which gives you
-concurrency across clients, each handled by its own process.
+tiny-webdav reads the connection from **stdin (fd 0)**, serves it, and exits, so
+it must be launched per-connection in `nowait` mode. inetd does **not** speak
+TLS — it just hands over the raw TCP socket; tiny-webdav does the TLS handshake.
 
-inetd does **not** speak TLS; it just hands the accepted raw TCP socket to the
-program on stdin/stdout. tiny-webdav still performs the TLS handshake itself, so
-this works exactly as it does in standalone mode. Pass `--inetd` and use the
-`nowait` service type:
-
-`/etc/inetd.conf` entry (one line):
-
-```
-8443 stream tcp nowait nobody /usr/local/bin/tiny-webdav tiny-webdav \
-  --inetd --cert /etc/tiny-webdav/server.crt --key /etc/tiny-webdav/server.key \
-  --root /srv/files --auth-file /etc/tiny-webdav/users.txt \
-  --log-file /var/log/tiny-webdav.log
-```
-
-xinetd equivalent (`/etc/xinetd.d/tiny-webdav`):
+`/etc/xinetd.d/tiny-webdav`:
 
 ```
 service tiny-webdav {
@@ -163,71 +118,50 @@ service tiny-webdav {
     socket_type = stream
     protocol    = tcp
     wait        = no
-    user        = nobody
+    user        = root
     server      = /usr/local/bin/tiny-webdav
-    server_args = --inetd --cert /etc/tiny-webdav/server.crt --key /etc/tiny-webdav/server.key --root /srv/files --auth-file /etc/tiny-webdav/users.txt --log-file /var/log/tiny-webdav.log
+    server_args = --cert /etc/tiny-webdav/server.crt --key /etc/tiny-webdav/server.key --client-ca /etc/tiny-webdav/ca.crt --root /srv/files --log-file /var/log/tiny-webdav.log
 }
 ```
 
-Notes for inetd mode:
+`/etc/inetd.conf` equivalent (one line):
 
-- The server reads the connection from **stdin (fd 0)**, serves it, and exits.
-  Use `nowait` so inetd forks a fresh process per connection (`wait` would let
-  only one connection be handled at a time).
-- Because inetd duplicates the client socket onto stdout/stderr too, the server
-  redirects those away on startup so no diagnostic can corrupt the TLS stream.
-  Use `--log-file <path>` to capture diagnostics; otherwise they go to
-  `/dev/null`.
-- `--addr` is ignored in `--inetd` mode (inetd owns the listening socket).
-- Use real `--cert`/`--key` files here; `--self-signed` is rejected in `--inetd`
-  mode (it would generate a new certificate for every connection).
-- The per-connection process still chroots and drops to `nobody` — but only if
-  inetd starts it **as root**. If the inetd line runs it as `nobody` (as the
-  examples above do), it's already unprivileged, so chroot is skipped; run it as
-  `root` in the inetd config if you want the chroot confinement.
-- `--inetd` is Unix-only.
-
-### Username/password auth
-
-Either point at a credentials file...
-
-```sh
-cat > users.txt <<'EOF'
-# username:password   (the password may itself contain ':')
-alice:s3cret
-bob:p@ss:word
-EOF
-
-./target/release/tiny-webdav \
-  --cert certs/server.crt --key certs/server.key --client-ca certs/ca.crt \
-  --root ./served --auth-file users.txt
+```
+8443 stream tcp nowait root /usr/local/bin/tiny-webdav tiny-webdav \
+  --cert /etc/tiny-webdav/server.crt --key /etc/tiny-webdav/server.key \
+  --client-ca /etc/tiny-webdav/ca.crt --root /srv/files \
+  --log-file /var/log/tiny-webdav.log
 ```
 
-...or pass a single user inline (note: arguments are visible in `ps`, so prefer
-`--auth-file` for anything real):
+Notes:
 
-```sh
-./target/release/tiny-webdav ... --user alice --password s3cret
-```
+- Use `nowait` so a fresh process is forked per connection (`wait` would serve
+  only one connection at a time).
+- The client socket is also duplicated onto stdout/stderr, so the program
+  redirects those away on startup to avoid corrupting the TLS stream. Use
+  `--log-file <path>` to capture diagnostics; otherwise they go to `/dev/null`.
+- Run it **as root** (as above) if you want the post-startup `chroot` +
+  `setuid(nobody)` confinement; if xinetd starts it as an unprivileged user,
+  that step is simply skipped.
+- Unix only.
 
 ## Connect
 
-With `curl` (note: a client cert is mandatory — omitting it fails the handshake):
+With `curl` (when a client cert is required, omitting it fails the handshake):
 
 ```sh
 curl --cacert certs/ca.crt \
      --cert   certs/client.crt \
      --key    certs/client.key \
-     https://localhost:4443/hello.txt
+     https://server.example:8443/hello.txt
 ```
 
-If username/password auth is enabled, add `-u user:password` as well — the
-client certificate alone is no longer sufficient:
+If username/password auth is enabled, add `-u user:password` as well:
 
 ```sh
 curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
      -u alice:s3cret \
-     https://localhost:4443/hello.txt
+     https://server.example:8443/hello.txt
 ```
 
 List a collection with PROPFIND:
@@ -235,7 +169,7 @@ List a collection with PROPFIND:
 ```sh
 curl -X PROPFIND -H 'Depth: 1' \
      --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key \
-     https://localhost:4443/
+     https://server.example:8443/
 ```
 
 ### Mounting from a desktop client
@@ -253,31 +187,27 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
 ## Security notes
 
 - This server is intentionally minimal. It is suitable for trusted, low-traffic,
-  read-only use behind client-certificate auth — not as a public, high-traffic
-  fileserver.
-- It is single-threaded: one connection is fully handled before the next is
-  accepted. A per-operation read/write timeout (`--timeout`, default 30s) bounds
-  how long a slow client can stall the loop, but a hostile client can still
-  reduce throughput. Because it is per-operation rather than idle-based, a
-  genuinely slow link pulling a very large file can trip it — raise `--timeout`
-  or set it to `0` for those cases. For concurrency across clients, run under
-  inetd (see above).
+  read-only use — not as a public, high-traffic fileserver.
+- Concurrency is whatever xinetd provides (one process per connection). Cap it in
+  the xinetd config (`instances`, `per_source`) for any exposed deployment, since
+  `nowait` otherwise forks unboundedly.
+- The per-operation read/write timeout (`--timeout`, default 30s) bounds how long
+  a slow client can stall a connection. Because it is per-operation rather than
+  idle-based, a genuinely slow link pulling a very large file can trip it — raise
+  `--timeout` or set it to `0` for those cases.
 - **"Read-only" means no client request can modify the served tree** (there is
-  no PUT/DELETE/etc.). The process itself may write two operator-specified files,
-  before any privilege drop: `--write-cert` and `--log-file`.
+  no PUT/DELETE/etc.). The process itself only writes the operator-specified
+  `--log-file`.
 - Symlinks under `--root` are followed, but a symlink whose target resolves
   *outside* the served root is refused (`403`) and omitted from listings, so it
   can't be used to escape the root. (After a successful `chroot` this is moot —
   nothing outside the root exists.)
-- **Privilege dropping:** once all setup is done (certificates and credentials
-  loaded into memory, listening socket bound), the process tries to `chroot`
-  into the served directory and drop to the `nobody` user/group. After a
-  successful `chroot` the served directory becomes `/`. This requires starting as
-  root (e.g. to also bind a privileged port). If the process isn't running as
-  root it prints a note to stderr and carries on unconfined; but if it *is* root
-  and the `setgid`/`setuid` drop fails, that is fatal (it will not keep serving
-  with root privileges). For the dropped `nobody` user to read the files, they
-  must be readable by that account.
+- **Privilege dropping:** once setup is done (certificates and credentials are in
+  memory), the process tries to `chroot` into the served directory and drop to
+  the `nobody` user/group; after a successful `chroot` the served directory
+  becomes `/`. This requires being started as root. If it isn't root it logs a
+  note and carries on unconfined; if it *is* root and the `setgid`/`setuid` drop
+  fails, that is fatal (it will not keep serving with root privileges). For the
+  dropped `nobody` user to read the files, they must be readable by that account.
 - The example certificates from `gen-certs.sh` are for testing only. Use your
   own PKI in production and keep private keys readable only by their owner.
-```

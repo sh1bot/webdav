@@ -33,10 +33,6 @@ impl Auth {
         !self.creds.is_empty()
     }
 
-    pub fn user_count(&self) -> usize {
-        self.creds.len()
-    }
-
     /// Add a single `username` / `password` credential.
     pub fn add(&mut self, username: String, password: String) {
         self.creds.insert(username, password);
