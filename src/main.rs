@@ -1,42 +1,33 @@
-//! tiny-webdav: a read-only WebDAV server over TLS, run under inetd / xinetd.
+//! tiny-webdav: a read-only WebDAV server run under inetd / xinetd, with TLS
+//! terminated by **stunnel** in front of it.
 //!
-//! There is no standalone listening mode: inetd/xinetd (in `nowait` mode)
-//! accepts each connection and hands us the already-connected socket on stdin
-//! (fd 0); we perform the TLS handshake ourselves, serve the one request, and
-//! exit. That gives per-connection concurrency (one process per client) for
-//! free.
+//! This program speaks *plaintext* HTTP. It does not do TLS itself: stunnel
+//! terminates TLS (and verifies client certificates, if configured), then hands
+//! us the decrypted connection on stdin (fd 0) — the classic inetd contract.
+//! We serve the one request and exit, so stunnel/inetd gives per-connection
+//! concurrency (one process per client) for free.
 //!
-//! Two optional, stackable authentication layers are available: client
-//! certificates (mutual TLS — "private key sign-in", where the TLS handshake
-//! proves the client holds a private key whose certificate we trust) and HTTP
-//! Basic username/password. Either, both, or (with a warning) neither can be
-//! required.
+//! Access control splits across the two layers: **client certificate (mutual
+//! TLS)** is enforced by stunnel (`verify`/`CAfile`, which we never see), while
+//! **HTTP Basic username/password** is enforced here, layered on top. If no
+//! Basic credentials are configured, this program enforces no auth of its own
+//! and relies entirely on stunnel / the network for access control.
 
 mod auth;
 mod dav;
 mod http;
 mod util;
 
-use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::time::Duration;
-
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{RootCertStore, ServerConfig, ServerConnection};
 
 use auth::Auth;
 
 struct Args {
     root: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
-    client_ca: Option<PathBuf>,
-    client_cert_optional: bool,
     auth_file: Option<PathBuf>,
     user: Option<String>,
     password: Option<String>,
@@ -47,25 +38,20 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "tiny-webdav — read-only WebDAV over TLS, run under inetd/xinetd\n\n\
-         It serves a single connection passed on stdin (fd 0) and exits, so it\n\
-         must be launched per-connection by inetd/xinetd in 'nowait' mode.\n\n\
+        "tiny-webdav — read-only WebDAV, run under inetd/xinetd behind stunnel\n\n\
+         It speaks plaintext HTTP on a connection passed on stdin (fd 0) and\n\
+         exits. Put stunnel in front to terminate TLS (and verify client certs);\n\
+         launch it per-connection from stunnel's exec/execargs or from\n\
+         inetd/xinetd in 'nowait' mode.\n\n\
          USAGE:\n  \
-           tiny-webdav --cert <server.crt> --key <server.key> [--root <dir>] [options]\n\n\
+           tiny-webdav [--root <dir>] [options]\n\n\
          OPTIONS:\n  \
-           --cert <file>           PEM server certificate (chain) presented to clients\n  \
-           --key <file>            PEM server private key\n  \
            --root <dir>            Directory to serve (default: current directory)\n  \
            --timeout <secs>        Per-read/write socket timeout (default: 30, 0 to\n                          \
                        disable; raise/disable for large transfers to slow links)\n  \
            --log-file <file>       Send diagnostics here (stdout/stderr are the\n                          \
-                       client socket, so they are otherwise discarded)\n\n  \
-           Client-certificate auth (mTLS):\n  \
-           --client-ca <ca.crt>    Verify client certs against this CA. Omit to\n                          \
-                       disable client-cert auth entirely.\n  \
-           --client-cert-optional  Accept clients without a cert; still verify any\n                          \
-                       cert that *is* presented (requires --client-ca).\n\n  \
-           HTTP Basic auth (layered on top of any client-cert auth):\n  \
+                       client connection, so they are otherwise discarded)\n\n  \
+           HTTP Basic auth (client certs are handled by stunnel, not here):\n  \
            --auth-file <file>      File of 'username:password' lines (# comments)\n  \
            --user <name>           A single username (use with --password)\n  \
            --password <pass>       Password for --user\n  \
@@ -76,10 +62,6 @@ fn usage() -> ! {
 
 fn parse_args() -> Args {
     let mut root = PathBuf::from(".");
-    let mut cert: Option<PathBuf> = None;
-    let mut key: Option<PathBuf> = None;
-    let mut client_ca: Option<PathBuf> = None;
-    let mut client_cert_optional = false;
     let mut auth_file: Option<PathBuf> = None;
     let mut user: Option<String> = None;
     let mut password: Option<String> = None;
@@ -91,10 +73,6 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--root" => root = PathBuf::from(it.next().unwrap_or_else(|| usage())),
-            "--cert" => cert = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
-            "--key" => key = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
-            "--client-ca" => client_ca = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
-            "--client-cert-optional" => client_cert_optional = true,
             "--auth-file" => auth_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--user" => user = Some(it.next().unwrap_or_else(|| usage())),
             "--password" => password = Some(it.next().unwrap_or_else(|| usage())),
@@ -118,24 +96,9 @@ fn parse_args() -> Args {
         eprintln!("error: --user and --password must be given together\n");
         usage();
     }
-    if client_cert_optional && client_ca.is_none() {
-        eprintln!("error: --client-cert-optional requires --client-ca\n");
-        usage();
-    }
-    let (cert, key) = match (cert, key) {
-        (Some(c), Some(k)) => (c, k),
-        _ => {
-            eprintln!("error: --cert and --key are required\n");
-            usage();
-        }
-    };
 
     Args {
         root,
-        cert,
-        key,
-        client_ca,
-        client_cert_optional,
         auth_file,
         user,
         password,
@@ -156,128 +119,57 @@ fn build_auth(args: &Args) -> io::Result<Auth> {
     Ok(auth)
 }
 
-fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader).collect::<Result<_, _>>()?;
-    if certs.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("no certificates found in {}", path.display()),
-        ));
-    }
-    Ok(certs)
-}
-
-fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("no private key found in {}", path.display()),
-        )
-    })
-}
-
-fn build_tls_config(args: &Args) -> io::Result<ServerConfig> {
-    let server_certs = load_certs(&args.cert)?;
-    let server_key = load_key(&args.key)?;
-
-    let to_invalid = |e: rustls::Error| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
-
-    let builder = ServerConfig::builder();
-    let with_certs = match &args.client_ca {
-        // No client CA configured: don't request client certificates at all.
-        None => builder.with_no_client_auth(),
-        Some(ca_path) => {
-            // Trust anchors used to verify *client* certificates.
-            let mut roots = RootCertStore::empty();
-            for ca in load_certs(ca_path)? {
-                roots.add(ca).map_err(to_invalid)?;
-            }
-            let vb = WebPkiClientVerifier::builder(Arc::new(roots));
-            // `--client-cert-optional` lets clients connect without a cert,
-            // while still verifying any cert that *is* presented. Otherwise a
-            // valid client certificate is mandatory.
-            let verifier = if args.client_cert_optional {
-                vb.allow_unauthenticated().build()
-            } else {
-                vb.build()
-            }
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            builder.with_client_cert_verifier(verifier)
-        }
-    };
-
-    with_certs
-        .with_single_cert(server_certs, server_key)
-        .map_err(to_invalid)
-}
-
-fn serve_connection(
-    config: Arc<ServerConfig>,
-    root: &Path,
-    auth: &Auth,
-    timeout: u64,
-    mut tcp: TcpStream,
-) -> io::Result<()> {
+/// Serve the single plaintext connection on `tcp` (fd 0 from stunnel/inetd).
+fn serve_connection(root: &Path, auth: &Auth, timeout: u64, mut tcp: TcpStream) -> io::Result<()> {
     // Bound how long a single blocking I/O can stall us. `--timeout 0` disables
     // it (needed for large transfers to slow links, since this is a
-    // per-operation timeout, not an idle timeout).
+    // per-operation timeout, not an idle timeout). Best-effort: the inherited
+    // fd may not support socket timeouts in every stunnel/inetd configuration.
     let to = (timeout != 0).then(|| Duration::from_secs(timeout));
-    tcp.set_read_timeout(to)?;
-    tcp.set_write_timeout(to)?;
+    let _ = tcp.set_read_timeout(to);
+    let _ = tcp.set_write_timeout(to);
 
-    let mut conn = ServerConnection::new(config).map_err(|e| io::Error::other(e.to_string()))?;
-
-    {
-        // rustls::Stream drives the TLS handshake transparently on first I/O.
-        let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
-        let req = http::read_request(&mut tls)?;
-        dav::handle(&mut tls, root, auth, &req)?;
-    }
-
-    // Best-effort clean TLS shutdown.
-    conn.send_close_notify();
-    let _ = conn.complete_io(&mut tcp);
-    Ok(())
+    let req = http::read_request(&mut tcp)?;
+    dav::handle(&mut tcp, root, auth, &req)?;
+    tcp.flush()
 }
 
-/// Serve the single connection inetd/xinetd handed us on stdin (fd 0).
+/// Serve the single connection stunnel/inetd handed us on stdin (fd 0).
 #[cfg(unix)]
-fn serve_stdin(config: Arc<ServerConfig>, root: &Path, auth: &Auth, timeout: u64) {
+fn serve_stdin(root: &Path, auth: &Auth, timeout: u64) {
     use std::os::unix::io::FromRawFd;
 
-    // Safety: under inetd, fd 0 is the connected, owned TCP socket. We take
+    // Safety: under inetd/stunnel, fd 0 is the connected, owned socket. We take
     // ownership of it; it is closed when the resulting TcpStream is dropped.
     let sock = unsafe { TcpStream::from_raw_fd(0) };
     let peer = sock
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "?".to_string());
-    if let Err(e) = serve_connection(config, root, auth, timeout, sock) {
+    if let Err(e) = serve_connection(root, auth, timeout, sock) {
         eprintln!("[{}] connection error: {}", peer, e);
     }
 }
 
 #[cfg(not(unix))]
-fn serve_stdin(_config: Arc<ServerConfig>, _root: &Path, _auth: &Auth, _timeout: u64) {
+fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64) {
     eprintln!("error: tiny-webdav is only supported on Unix platforms");
     process::exit(1);
 }
 
-/// inetd/xinetd duplicates the client socket onto stdout and stderr too, so
+/// inetd/stunnel duplicates the client connection onto stdout and stderr too, so
 /// point fd 1 (and fd 2) somewhere harmless before we emit anything — otherwise
-/// a stray diagnostic would corrupt the TLS stream. fd 1 always goes to
-/// /dev/null; fd 2 goes to `--log-file` if given, else /dev/null. fd 0 (the
-/// socket we actually serve) is left untouched.
+/// a stray diagnostic would corrupt the stream stunnel re-encrypts to the
+/// client. fd 1 always goes to /dev/null; fd 2 goes to `--log-file` if given,
+/// else /dev/null. fd 0 (the connection we actually serve) is left untouched.
 #[cfg(unix)]
 fn redirect_streams(log_file: Option<&Path>) {
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
 
     // /dev/null must open: if it doesn't, fd 1 would stay pointed at the client
-    // socket and any later output would corrupt the TLS stream. Fail closed —
-    // and silently, since stderr may itself still be the socket.
+    // connection and any later output would corrupt the stream. Fail closed —
+    // and silently, since stderr may itself still be the connection.
     let devnull = match OpenOptions::new().write(true).open("/dev/null") {
         Ok(f) => f,
         Err(_) => process::exit(1),
@@ -301,18 +193,10 @@ fn redirect_streams(_log_file: Option<&Path>) {}
 fn main() {
     let args = parse_args();
 
-    // stdin/stdout/stderr are the client socket. Redirect stdout and stderr
+    // stdin/stdout/stderr are the client connection. Redirect stdout and stderr
     // away *first* so no diagnostic ever leaks onto the wire and corrupts the
-    // TLS stream. Done before any other output.
+    // stream. Done before any other output.
     redirect_streams(args.log_file.as_deref());
-
-    // Install the `ring` crypto provider as the process default.
-    if rustls::crypto::ring::default_provider()
-        .install_default()
-        .is_err()
-    {
-        eprintln!("warning: a default crypto provider was already installed");
-    }
 
     let canonical_root = match args.root.canonicalize() {
         Ok(p) => p,
@@ -329,14 +213,6 @@ fn main() {
         process::exit(1);
     }
 
-    let config = match build_tls_config(&args) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            eprintln!("error: TLS configuration failed: {}", e);
-            process::exit(1);
-        }
-    };
-
     let auth = match build_auth(&args) {
         Ok(a) => a,
         Err(e) => {
@@ -345,24 +221,23 @@ fn main() {
         }
     };
 
-    // Warn (to the --log-file, if configured) when the server requires no
-    // authentication at all.
-    let cert_required = args.client_ca.is_some() && !args.client_cert_optional;
-    if !cert_required && !auth.is_enabled() {
+    // We only enforce HTTP Basic auth; client certs (if any) are stunnel's job.
+    // Warn (to the --log-file, if configured) when we enforce no auth ourselves.
+    if !auth.is_enabled() {
         eprintln!(
-            "WARNING: no client-cert requirement and no password — \
-             anyone who can reach this server can read the served files."
+            "WARNING: no HTTP Basic auth configured — tiny-webdav enforces no \
+             access control of its own; rely on stunnel (client certs) / network."
         );
     }
 
-    // Everything that needs the original filesystem is done (certs and
-    // credentials are in memory). Confine the process: chroot into the served
-    // directory and drop to an unprivileged user. If we lack the privileges
-    // (i.e. xinetd already started us as a non-root user), this is skipped.
-    // The returned path is the root to serve from afterwards (`/` once chrooted).
+    // Everything that needs the original filesystem is done (credentials are in
+    // memory). Confine the process: chroot into the served directory and drop to
+    // an unprivileged user. If we lack the privileges (i.e. we were started as a
+    // non-root user already), this is skipped. The returned path is the root to
+    // serve from afterwards (`/` once chrooted).
     let serve_root = lower_privileges(&canonical_root);
 
-    serve_stdin(config, &serve_root, &auth, args.timeout);
+    serve_stdin(&serve_root, &auth, args.timeout);
 }
 
 /// Confine the process after startup: `chroot` into `root`, then drop to the
@@ -376,7 +251,7 @@ fn lower_privileges(root: &Path) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
 
     // If we're not effectively root we can't chroot or change uid; say so once
-    // and carry on with current privileges. (xinetd typically starts the
+    // and carry on with current privileges. (stunnel/xinetd typically start the
     // service as an unprivileged user already, in which case this is expected.)
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("not running as root: skipping chroot and privilege drop");

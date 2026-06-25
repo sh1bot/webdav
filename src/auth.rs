@@ -1,12 +1,14 @@
-//! Optional HTTP Basic authentication, layered on top of the mandatory mTLS.
+//! Optional HTTP Basic authentication. This is the only auth tiny-webdav
+//! enforces itself; client-certificate (mutual TLS) auth, if used, is handled
+//! by stunnel in front of us.
 //!
 //! Credentials are read from a file (`user:password` per line) and/or a single
 //! inline `--user`/`--password` pair. If no credentials are configured, Basic
-//! auth is disabled and only the client certificate is required. When enabled,
-//! every request must additionally carry valid `Authorization: Basic` creds.
+//! auth is disabled. When enabled, every request must carry valid
+//! `Authorization: Basic` credentials.
 //!
 //! Basic auth sends the password in (base64 of) cleartext, which is fine here
-//! because the entire connection is already encrypted by TLS.
+//! because stunnel has already encrypted the entire connection with TLS.
 
 use std::collections::HashMap;
 use std::fs;
