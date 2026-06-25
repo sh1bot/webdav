@@ -1,0 +1,35 @@
+; Example stunnel configuration for running tiny-webdav under xinetd/inetd.
+;
+; Use this when you want xinetd (not stunnel) to own the listening socket.
+; xinetd accepts each connection and execs stunnel; stunnel terminates TLS
+; (and verifies the client certificate), then execs tiny-webdav with the
+; decrypted connection on fd 0.
+;
+;   xinetd --> stunnel (this config) --> tiny-webdav
+;
+; INETD MODE uses stunnel's GLOBAL section — there is NO [service] header and
+; NO `accept` option. stunnel reads the TLS connection from the socket xinetd
+; hands it on stdin. (If you'd rather stunnel own the socket itself, use
+; stunnel.conf.example instead, which has an [service] section with `accept`.)
+;
+; Pair this with the xinetd service in the README. Run xinetd's service as root
+; if you want tiny-webdav to chroot + drop to `nobody`.
+
+; Logging MUST NOT go to stderr here: under xinetd, stderr is the client socket,
+; so a stray log line would corrupt the TLS stream. Send it to a file instead.
+syslog = no
+output = /var/log/stunnel-tiny-webdav.log
+foreground = yes
+
+; --- Server identity presented to clients ---
+cert = /etc/tiny-webdav/server.crt
+key  = /etc/tiny-webdav/server.key
+
+; --- Client-certificate auth (mutual TLS). Delete these two lines to disable
+;     it and rely on tiny-webdav's HTTP Basic auth (and/or the network). ---
+CAfile = /etc/tiny-webdav/ca.crt
+verify = 2
+
+; --- Run tiny-webdav per connection, speaking plaintext on stdin/stdout ---
+exec     = /usr/local/bin/tiny-webdav
+execargs = tiny-webdav --root /srv/files --auth-file /etc/tiny-webdav/users.txt --log-file /var/log/tiny-webdav.log

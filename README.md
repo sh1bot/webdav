@@ -95,9 +95,42 @@ process per connection with the plaintext stream on fd 0.
 - Run stunnel **as root** if you want tiny-webdav to `chroot` + drop to `nobody`
   per connection (it inherits stunnel's privileges); otherwise that step is
   skipped.
-- Prefer fronting stunnel with xinetd? Run stunnel in inetd mode (a config with
-  no `accept`) as the xinetd `server`, so xinetd owns the socket and execs
-  stunnel, which execs tiny-webdav.
+
+### Letting xinetd own the socket (optional)
+
+stunnel's `exec` mode already forks one process per connection, so you usually
+don't need inetd/xinetd at all. But if you want **xinetd** to own the listening
+socket — e.g. to reuse its `instances` / `per_source` connection limits — run
+stunnel in **inetd mode** as the xinetd `server`:
+
+```
+xinetd --> stunnel (inetd mode) --> tiny-webdav
+```
+
+Inetd mode uses stunnel's **global section** — no `[service]` header and no
+`accept` (stunnel reads the connection xinetd hands it on fd 0). See
+[`stunnel-inetd.conf.example`](stunnel-inetd.conf.example), and point xinetd at
+it:
+
+```
+# /etc/xinetd.d/tiny-webdav
+service tiny-webdav {
+    type        = UNLISTED
+    port        = 8443
+    socket_type = stream
+    protocol    = tcp
+    wait        = no                 # one process per connection
+    user        = root               # so tiny-webdav can chroot + drop to nobody
+    instances   = 50                 # cap concurrent connections
+    per_source  = 5                  # ...and per client IP
+    server      = /usr/bin/stunnel
+    server_args = /etc/stunnel/tiny-webdav-inetd.conf
+}
+```
+
+In inetd mode stunnel's stderr is the client socket, so make sure its logging
+goes to syslog or a file (`syslog`/`output`), never stderr — the example config
+does this.
 
 ### tiny-webdav options
 
