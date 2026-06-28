@@ -59,8 +59,27 @@ because `SSL_CLIENT_DN` is present.
 
 ## Build
 
+The build defaults to a **fully static** binary (musl libc, statically linked) —
+a single self-contained executable with no shared-library dependencies, which is
+convenient to drop onto a server and run under stunnel/xinetd. Add the target
+once, then build:
+
 ```sh
+rustup target add x86_64-unknown-linux-musl   # one-time
 cargo build --release
+# -> target/x86_64-unknown-linux-musl/release/tiny-webdav
+```
+
+```sh
+file target/x86_64-unknown-linux-musl/release/tiny-webdav
+# ELF 64-bit ... static-pie linked
+```
+
+The default target is set in [`.cargo/config.toml`](.cargo/config.toml). For a
+dynamically linked glibc build instead, override it:
+
+```sh
+cargo build --release --target x86_64-unknown-linux-gnu
 ```
 
 ## Generate test certificates
