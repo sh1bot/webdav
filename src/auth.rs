@@ -11,9 +11,7 @@
 //! because stunnel has already encrypted the entire connection with TLS.
 
 use std::collections::HashMap;
-use std::fs;
-use std::io;
-use std::path::Path;
+use std::io::{self, Read};
 
 use crate::http::{self, Request};
 
@@ -42,8 +40,11 @@ impl Auth {
 
     /// Load `username:password` lines from a file. Blank lines and lines
     /// starting with `#` are ignored. The password may itself contain `:`.
-    pub fn load_file(&mut self, path: &Path) -> io::Result<()> {
-        let text = fs::read_to_string(path)?;
+    /// Reads from an already-open `reader` (so the file can be opened before a
+    /// chroot/privilege drop and parsed afterwards); `source` only labels errors.
+    pub fn load(&mut self, mut reader: impl Read, source: &str) -> io::Result<()> {
+        let mut text = String::new();
+        reader.read_to_string(&mut text)?;
         for (lineno, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -56,11 +57,7 @@ impl Auth {
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "{}:{}: expected 'username:password'",
-                            path.display(),
-                            lineno + 1
-                        ),
+                        format!("{}:{}: expected 'username:password'", source, lineno + 1),
                     ));
                 }
             }

@@ -105,10 +105,14 @@ fn parse_args() -> Args {
     }
 }
 
-fn build_auth(args: &Args) -> io::Result<Auth> {
+/// Parse credentials. `auth_file` is the *already-open* `--auth-file` (opened
+/// before the chroot/privilege drop); parsing it happens here, after the drop, so
+/// the bug-prone work runs unprivileged. The path string is only for error text.
+fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
     let mut auth = Auth::new(args.realm.clone());
-    if let Some(path) = &args.auth_file {
-        auth.load_file(path)?;
+    if let Some(file) = auth_file {
+        let source = args.auth_file.as_deref().unwrap_or(Path::new("-"));
+        auth.load(file, &source.display().to_string())?;
     }
     if let (Some(u), Some(p)) = (&args.user, &args.password) {
         auth.add(u.clone(), p.clone());
@@ -187,7 +191,31 @@ fn main() {
         process::exit(1);
     }
 
-    let auth = match build_auth(&args) {
+    // Open --auth-file now, before the chroot/drop, while its path is reachable
+    // and we still have the privilege to read it — but don't parse it yet. The
+    // parsing happens after the drop, so that bug-prone work runs unprivileged.
+    let auth_file = match &args.auth_file {
+        Some(path) => match File::open(path) {
+            Ok(f) => Some(f),
+            Err(e) => fatal(&format!(
+                "cannot open --auth-file {}: {}",
+                path.display(),
+                e
+            )),
+        },
+        None => None,
+    };
+
+    // Everything taken from the command line is now open: --log-file is dup'd onto
+    // fd 2 and --auth-file holds an fd, both before the chroot (the served files
+    // live inside the chroot and are opened after it). Now confine: if we're root,
+    // chroot into the served directory and drop to `nobody`; the returned path is
+    // what we serve from ("/" once chrooted). If we aren't root (e.g. stunnel
+    // already dropped us), this is a no-op and we serve the canonical root as-is.
+    let serve_root = lower_privileges(&canonical_root);
+
+    // Now unprivileged: parse the (already-open) auth file and inline credentials.
+    let auth = match build_auth(&args, auth_file) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: cannot load credentials: {}", e);
@@ -207,15 +235,6 @@ fn main() {
              this server can read the served files."
         );
     }
-
-    // Everything taken from the command line is now open: --log-file is dup'd
-    // onto fd 2 and --auth-file has been read into memory, both before the chroot
-    // below (the served files themselves live inside the chroot and are opened
-    // after it). Now confine: if we're root, chroot into the served directory and
-    // drop to `nobody`. The returned path is what we serve from afterwards — "/"
-    // once chrooted. If we aren't root (e.g. stunnel already dropped us), this is
-    // a no-op and we serve the canonical root as-is.
-    let serve_root = lower_privileges(&canonical_root);
 
     serve_stdin(&serve_root, &auth);
 }
