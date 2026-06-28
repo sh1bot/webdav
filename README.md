@@ -45,8 +45,9 @@ because `SSL_CLIENT_DN` is present.
   unsatisfiable ranges, and advertises `Accept-Ranges: bytes`. `If-Range` is
   honoured, so a resumed download whose file changed restarts cleanly instead
   of splicing two versions.
-- File bodies are streamed in 64 KiB chunks (seeking for ranges), so even
-  multi-gigabyte files are served with near-constant memory.
+- File bodies are sent with the kernel's `sendfile(2)` (offset/length for
+  ranges), so bytes go straight from the page cache to the socket without passing
+  through userspace — even multi-gigabyte files use near-constant memory.
 - Every mutating method (`PUT`, `DELETE`, `MKCOL`, `MOVE`, `COPY`,
   `PROPPATCH`, `LOCK`, …) is rejected with `405 Method Not Allowed`.
 - Optional HTTP Basic username/password auth (`401` challenge with

@@ -139,7 +139,7 @@ pub fn write_response<S: Write>(
 
 /// Write just the status line and headers, declaring `content_length` but
 /// emitting no body. Callers stream the body themselves afterwards (see
-/// [`stream_body`]) — this lets us serve arbitrarily large files without ever
+/// [`send_file`]) — this lets us serve arbitrarily large files without ever
 /// holding them in memory.
 pub fn write_head<S: Write>(
     stream: &mut S,
@@ -165,24 +165,44 @@ pub fn write_head<S: Write>(
     stream.write_all(head.as_bytes())
 }
 
-/// Copy exactly `len` bytes from `reader` to `writer` in fixed-size chunks,
-/// then flush. Used to stream file bodies after [`write_head`].
-pub fn stream_body<R: Read, W: Write>(reader: &mut R, writer: &mut W, len: u64) -> io::Result<()> {
-    const CHUNK: usize = 64 * 1024;
-    let mut buf = vec![0u8; CHUNK];
-    let mut remaining = len;
+/// Stream `count` bytes of `file` starting at byte `offset` to the socket
+/// `out_fd` using the kernel's `sendfile(2)`, so the bytes go straight from the
+/// page cache to the socket without ever passing through userspace. Used to send
+/// file bodies after [`write_head`].
+///
+/// The kernel advances its own copy of the offset (the `off` pointer), so the
+/// file's cursor is untouched and ranges need no prior `seek`. A short transfer
+/// (fewer bytes than the declared length) means the file was truncated under us;
+/// we stop, and `Connection: close` framing bounds the response.
+#[cfg(unix)]
+pub fn send_file(
+    out_fd: std::os::unix::io::RawFd,
+    file: &std::fs::File,
+    offset: u64,
+    count: u64,
+) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let in_fd = file.as_raw_fd();
+    let mut off = offset as libc::off_t;
+    let mut remaining = count;
     while remaining > 0 {
-        let want = remaining.min(CHUNK as u64) as usize;
-        let n = reader.read(&mut buf[..want])?;
-        if n == 0 {
-            // File ended sooner than its declared length (e.g. truncated
-            // concurrently). Stop; the Connection: close framing bounds it.
-            break;
+        // sendfile transfers at most ~2 GiB per call.
+        let want = remaining.min(0x7fff_f000) as usize;
+        let sent = unsafe { libc::sendfile(out_fd, in_fd, &mut off, want) };
+        if sent < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
         }
-        writer.write_all(&buf[..n])?;
-        remaining -= n as u64;
+        if sent == 0 {
+            break; // file ended before its declared length
+        }
+        remaining -= sent as u64;
     }
-    writer.flush()
+    Ok(())
 }
 
 /// Convenience for short text/error responses.

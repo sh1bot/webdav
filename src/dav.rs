@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,7 +14,7 @@ use crate::util;
 
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND";
 
-pub fn handle<S: Read + Write>(
+pub fn handle<S: Read + Write + AsRawFd>(
     stream: &mut S,
     root: &Path,
     auth: &Auth,
@@ -65,7 +66,7 @@ fn options<S: Write>(stream: &mut S) -> io::Result<()> {
     )
 }
 
-fn get_or_head<S: Write>(
+fn get_or_head<S: Write + AsRawFd>(
     stream: &mut S,
     root: &Path,
     decoded_path: &str,
@@ -178,9 +179,10 @@ struct Resp<'a> {
 }
 
 /// Stream `count` bytes of a file starting at byte `offset` as the response
-/// body, after writing the status line and headers. The file is read in
-/// chunks (see [`http::stream_body`]) so large files never sit in memory.
-fn stream_file<S: Write>(
+/// body, after writing the status line and headers. The body goes straight from
+/// the page cache to the socket via the kernel (see [`http::send_file`]), so
+/// large files never sit in memory.
+fn stream_file<S: Write + AsRawFd>(
     stream: &mut S,
     fs_path: &Path,
     offset: u64,
@@ -188,17 +190,13 @@ fn stream_file<S: Write>(
     resp: &Resp,
     send_body: bool,
 ) -> io::Result<()> {
-    use std::io::{Seek as _, SeekFrom};
-
-    // Open (and seek) before writing the header so a failure can still be
-    // reported as an error response rather than a truncated body.
-    let mut file = match fs::File::open(fs_path) {
+    // Open before writing the header so a failure can still be reported as an
+    // error response rather than a truncated body. sendfile takes the offset
+    // directly, so there is no need to seek.
+    let file = match fs::File::open(fs_path) {
         Ok(f) => f,
         Err(e) => return err_status(stream, &e),
     };
-    if offset != 0 && file.seek(SeekFrom::Start(offset)).is_err() {
-        return http::write_status(stream, 500, "Internal Server Error");
-    }
 
     http::write_head(
         stream,
@@ -209,7 +207,7 @@ fn stream_file<S: Write>(
         count,
     )?;
     if send_body {
-        http::stream_body(&mut file, stream, count)?;
+        http::send_file(stream.as_raw_fd(), &file, offset, count)?;
     } else {
         stream.flush()?;
     }
