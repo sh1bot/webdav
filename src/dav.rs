@@ -429,14 +429,16 @@ fn directory_index_html(root: &Path, decoded_path: &str, fs_path: &Path) -> Stri
     let title = util::xml_escape(decoded_path);
 
     let mut html = String::new();
-    html.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">");
+    html.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
     html.push_str(&format!("<title>Index of {}</title>", title));
     html.push_str(
         "<style>body{font-family:sans-serif}td,th{text-align:left;padding:0 1.5rem 0 0}</style></head><body>",
     );
     html.push_str(&format!("<h1>Index of {}</h1>", title));
     html.push_str(
-        "<table><thead><tr><th>Name</th><th>Last modified (UTC)</th><th>Size</th></tr></thead><tbody>",
+        "<table><thead><tr><th scope=\"col\">Name</th>\
+         <th scope=\"col\">Last modified (UTC)</th>\
+         <th scope=\"col\">Size</th></tr></thead><tbody>",
     );
 
     if decoded_path != "/" {
