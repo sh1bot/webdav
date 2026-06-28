@@ -17,10 +17,9 @@ output = /var/log/stunnel-tiny-webdav.log
 
 ; --- Confinement: jail + drop privileges before exec'ing tiny-webdav ---
 ; cert/key/CAfile above are read BEFORE the chroot, so they live outside it.
-; Because tiny-webdav is a static binary, the jail needs only the binary,
-; dev/null, and the served tree:
+; Because tiny-webdav is a static binary that uses only stdin/stdout/stderr and
+; the served files, the jail needs only the binary and the served tree:
 ;   /srv/jail/tiny-webdav            (the static binary; exec target below)
-;   /srv/jail/dev/null               (mknod c 1 3; tiny-webdav points stdout here)
 ;   /srv/jail/files/...              (the served tree; --root /files below)
 chroot = /srv/jail
 setuid = nobody

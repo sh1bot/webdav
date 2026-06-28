@@ -23,8 +23,8 @@ foreground = yes
 
 ; --- Confinement: jail + drop privileges before exec'ing tiny-webdav ---
 ; cert/key/CAfile below are read BEFORE the chroot, so they live outside it.
-; The static binary means the jail needs only the binary, dev/null, the served
-; tree, and (since --log-file is required under xinetd, see below) a writable log.
+; The static binary means the jail needs only the binary, the served tree, and
+; (since --log-file is required under xinetd, see below) a writable log file.
 chroot = /srv/jail
 setuid = nobody
 setgid = nogroup

@@ -15,19 +15,20 @@
 //!
 //! Confinement is also stunnel's job: its `chroot` / `setuid` / `setgid` options
 //! jail the process and drop privileges before it execs us, so we run already
-//! unprivileged and need read no files of our own beyond /dev/null and the
-//! served tree.
+//! unprivileged. We read the request from stdin, write the reply to stdout, log
+//! to stderr, and otherwise touch only the served tree — so the chroot jail
+//! needs nothing in it but this (static) binary and the files being served.
 
 mod auth;
 mod dav;
 mod http;
 mod util;
 
-use std::io::{self, Write};
-use std::net::TcpStream;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::Duration;
 
 use auth::Auth;
 
@@ -125,35 +126,44 @@ fn build_auth(args: &Args) -> io::Result<Auth> {
     Ok(auth)
 }
 
-/// Serve the single plaintext connection on `tcp` (fd 0 from stunnel/inetd).
-fn serve_connection(root: &Path, auth: &Auth, timeout: u64, mut tcp: TcpStream) -> io::Result<()> {
-    // Bound how long a single blocking I/O can stall us. `--timeout 0` disables
-    // it (needed for large transfers to slow links, since this is a
-    // per-operation timeout, not an idle timeout). Best-effort: the inherited
-    // fd may not support socket timeouts in every stunnel/inetd configuration.
-    let to = (timeout != 0).then(|| Duration::from_secs(timeout));
-    let _ = tcp.set_read_timeout(to);
-    let _ = tcp.set_write_timeout(to);
-
-    let req = http::read_request(&mut tcp)?;
-    dav::handle(&mut tcp, root, auth, &req)?;
-    tcp.flush()
+/// Serve one request: read it from `input` (stdin) and write the reply to
+/// `output` (stdout). We make no assumption about what kind of descriptors
+/// these are — only that we can read the request from one and write the reply
+/// to the other, which is the inetd contract stunnel/xinetd satisfy.
+fn serve<R: Read, W: Write + AsRawFd>(
+    input: &mut R,
+    output: &mut W,
+    root: &Path,
+    auth: &Auth,
+) -> io::Result<()> {
+    let req = http::read_request(input)?;
+    dav::handle(output, root, auth, &req)?;
+    output.flush()
 }
 
-/// Serve the single connection stunnel/inetd handed us on stdin (fd 0).
+/// stunnel/inetd hands us the connection on the standard descriptors. Per the
+/// inetd contract we read the request from stdin (fd 0), write the reply to
+/// stdout (fd 1), and log to stderr (fd 2) — without assuming any of them is a
+/// socket. (Under stunnel/xinetd they all refer to one connection, but nothing
+/// here relies on that.)
 #[cfg(unix)]
 fn serve_stdin(root: &Path, auth: &Auth, timeout: u64) {
     use std::os::unix::io::FromRawFd;
 
-    // Safety: under inetd/stunnel, fd 0 is the connected, owned socket. We take
-    // ownership of it; it is closed when the resulting TcpStream is dropped.
-    let sock = unsafe { TcpStream::from_raw_fd(0) };
-    let peer = sock
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "?".to_string());
-    if let Err(e) = serve_connection(root, auth, timeout, sock) {
-        eprintln!("[{}] connection error: {}", peer, e);
+    // Safety: fd 0/1 are the inherited, owned connection descriptors. The File
+    // wrappers close them on drop — at process exit, after the one request.
+    let mut input = unsafe { File::from_raw_fd(0) };
+    let mut output = unsafe { File::from_raw_fd(1) };
+
+    // Best effort: *if* these are sockets, bound how long any single read/write
+    // may block (slowloris protection). Silently ignored on non-sockets, so this
+    // is opportunistic hardening, not an assumption that they are sockets.
+    if timeout != 0 {
+        set_socket_timeouts(timeout);
+    }
+
+    if let Err(e) = serve(&mut input, &mut output, root, auth) {
+        eprintln!("connection error: {}", e);
     }
 }
 
@@ -163,43 +173,20 @@ fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64) {
     process::exit(1);
 }
 
-/// stunnel hands us the connection on fd 0 and dups it onto fd 1, so point fd 1
-/// at /dev/null before we emit anything — a stray write to stdout would
-/// otherwise corrupt the stream stunnel re-encrypts to the client. fd 0 (the
-/// connection we serve) is left untouched.
-///
-/// fd 2 carries our diagnostics. By default we leave it alone so it flows to
-/// stunnel's own stderr — the systemd journal / terminal when stunnel runs as a
-/// daemon. `--log-file` redirects it to a file instead; that is what you want
-/// under xinetd, where the inherited stderr would otherwise be the client socket
-/// and logging to it would corrupt the connection.
+/// Best-effort `SO_RCVTIMEO` / `SO_SNDTIMEO` on the read (fd 0) and write (fd 1)
+/// descriptors. Any error (e.g. the fd isn't a socket) is ignored.
 #[cfg(unix)]
-fn redirect_streams(log_file: Option<&Path>) {
-    use std::fs::OpenOptions;
-    use std::os::unix::io::AsRawFd;
-
-    // /dev/null must open: if it doesn't, fd 1 would stay pointed at the client
-    // connection and any later output would corrupt the stream. Fail closed —
-    // and silently, since stderr may itself still be the connection.
-    let devnull = match OpenOptions::new().write(true).open("/dev/null") {
-        Ok(f) => f,
-        Err(_) => process::exit(1),
+fn set_socket_timeouts(secs: u64) {
+    let tv = libc::timeval {
+        tv_sec: secs as _, // infer tv_sec's width (time_t differs across libcs)
+        tv_usec: 0,
     };
-    unsafe { libc::dup2(devnull.as_raw_fd(), 1) };
-
-    // Only touch fd 2 when an explicit --log-file is given: send it there, or to
-    // /dev/null if it can't be opened — never leave it pointing at the
-    // connection. With no --log-file, fd 2 keeps inheriting stunnel's stderr.
-    if let Some(path) = log_file {
-        let log = OpenOptions::new().create(true).append(true).open(path).ok();
-        let fd = log
-            .as_ref()
-            .map(|f| f.as_raw_fd())
-            .unwrap_or(devnull.as_raw_fd());
-        unsafe { libc::dup2(fd, 2) };
+    let p = (&tv as *const libc::timeval).cast();
+    let len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    unsafe {
+        libc::setsockopt(0, libc::SOL_SOCKET, libc::SO_RCVTIMEO, p, len);
+        libc::setsockopt(1, libc::SOL_SOCKET, libc::SO_SNDTIMEO, p, len);
     }
-    // `devnull`/`log` File handles drop here, closing their original fds;
-    // the dup2'd descriptors remain valid.
 }
 
 #[cfg(not(unix))]
@@ -208,11 +195,28 @@ fn redirect_streams(_log_file: Option<&Path>) {}
 fn main() {
     let args = parse_args();
 
-    // stdin/stdout/stderr come from stunnel. Move stdout off the connection (and
-    // stderr too, if --log-file was given) *first*, before any output, so no
-    // diagnostic can corrupt the stream. Without --log-file, stderr is left
-    // flowing to stunnel's stderr (the journal under systemd).
-    redirect_streams(args.log_file.as_deref());
+    // Point our diagnostics (stderr) at --log-file, if given, before any output.
+    // With no --log-file, stderr stays as stunnel gave it — the systemd journal
+    // under a stunnel daemon. Under xinetd stderr is the client socket, so
+    // --log-file is required there to keep diagnostics off the wire. We never
+    // touch fd 0 (request) or fd 1 (reply).
+    if let Some(path) = &args.log_file {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => unsafe {
+                libc::dup2(f.as_raw_fd(), 2);
+            },
+            // Fail fast on a bad log path rather than risk writing diagnostics to
+            // the connection (the inherited stderr under xinetd).
+            Err(e) => {
+                eprintln!("error: cannot open --log-file {}: {}", path.display(), e);
+                process::exit(1);
+            }
+        }
+    }
 
     let canonical_root = match args.root.canonicalize() {
         Ok(p) => p,

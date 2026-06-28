@@ -131,12 +131,12 @@ process per connection with the plaintext stream on fd 0.
 tiny-webdav does **not** chroot or change uid itself. Instead, stunnel's `chroot`
 / `setuid` / `setgid` options jail the process and drop privileges *before* it
 execs tiny-webdav, so the server runs already-confined and unprivileged. Because
-the binary is **static**, the jail needs almost nothing in it:
+the binary is **static** and reads/writes only the standard descriptors and the
+served files, the jail needs nothing but the binary and the served tree:
 
 ```
 /srv/jail/
 ├── tiny-webdav            # the static binary (exec target, inside the jail)
-├── dev/null               # tiny-webdav points stdout here; mknod c 1 3
 └── files/                 # the served tree (--root /files)
     └── ...
 ```
@@ -287,8 +287,9 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
 - **Confinement and privilege drop are stunnel's responsibility** (`chroot` /
   `setuid` / `setgid`), applied before it execs tiny-webdav — see *Confinement*
   above. tiny-webdav contains no `chroot`/`setuid` code and reads no system files
-  of its own (no `/etc/passwd`): being a static binary, it runs in a jail
-  containing only itself, `/dev/null`, and the served tree. The served files (and
-  any `--auth-file`) must be readable by the user stunnel drops to.
+  of its own (no `/etc/passwd`, not even `/dev/null`): being a static binary that
+  uses only stdin/stdout/stderr and the served files, it runs in a jail
+  containing nothing but itself and the served tree. The served files (and any
+  `--auth-file`) must be readable by the user stunnel drops to.
 - The example certificates from `gen-certs.sh` are for testing only. Use your
   own PKI in production and keep private keys readable only by their owner.

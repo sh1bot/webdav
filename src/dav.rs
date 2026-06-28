@@ -3,7 +3,7 @@
 //! MOVE, PROPPATCH, LOCK, …) is answered with 405 Method Not Allowed.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,7 +14,7 @@ use crate::util;
 
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND";
 
-pub fn handle<S: Read + Write + AsRawFd>(
+pub fn handle<S: Write + AsRawFd>(
     stream: &mut S,
     root: &Path,
     auth: &Auth,
