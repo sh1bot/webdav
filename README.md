@@ -14,13 +14,18 @@ client --TLS--> stunnel (terminates TLS, verifies client cert) --plaintext--> ti
 Access control splits across the two layers, and you can use either or both:
 
 1. **Client certificate ("private key sign-in" / mutual TLS)** — enforced by
-   **stunnel** (`CAfile` + `verify`). tiny-webdav never sees the TLS. It can be
-   required, optional, or disabled, all in stunnel's config.
+   **stunnel** (`CAfile` + `verify`). tiny-webdav never sees the TLS itself, but
+   stunnel passes it the verified client identity in the `SSL_CLIENT_DN`
+   environment variable. Required/optional/disabled is set in stunnel's config.
 2. **HTTP Basic username/password** — enforced by **tiny-webdav**, layered on top
    (safe because stunnel has already encrypted the connection).
 
-If you configure neither, the server allows anonymous read access and logs a
-warning.
+tiny-webdav can't inspect the TLS handshake, so it judges "is this request
+authenticated?" from what it *can* see: the `SSL_CLIENT_DN` env var (a verified
+client cert from stunnel) and its own Basic credentials. It logs a warning only
+for a request that has **neither** — i.e. genuinely anonymous access. A
+cert-only deployment (stunnel `verify = 2`, no Basic auth) is *not* warned about,
+because `SSL_CLIENT_DN` is present.
 
 ## Features
 

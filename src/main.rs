@@ -232,12 +232,16 @@ fn main() {
         }
     };
 
-    // We only enforce HTTP Basic auth; client certs (if any) are stunnel's job.
-    // Warn (on stderr / the --log-file) when we enforce no auth ourselves.
-    if !auth.is_enabled() {
+    // We can't see the TLS layer, but stunnel exports SSL_CLIENT_DN when it has
+    // verified a client certificate. Treat that as authentication too, so a
+    // cert-only deployment isn't warned at. Warn only when a connection carries
+    // neither a verified client cert nor Basic credentials.
+    let client_cert = std::env::var("SSL_CLIENT_DN").is_ok_and(|v| !v.is_empty());
+    if !auth.is_enabled() && !client_cert {
         eprintln!(
-            "WARNING: no HTTP Basic auth configured — tiny-webdav enforces no \
-             access control of its own; rely on stunnel (client certs) / network."
+            "WARNING: unauthenticated request — no verified client certificate \
+             (SSL_CLIENT_DN unset) and no HTTP Basic auth; anyone who can reach \
+             this server can read the served files."
         );
     }
 
