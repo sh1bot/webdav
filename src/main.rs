@@ -245,6 +245,11 @@ fn lower_privileges(root: &Path) -> PathBuf {
 
     // Hardening that needs no privilege and is safe before any uid change.
     // Best-effort: failures here don't leave us *more* privileged.
+    //
+    // Both fields are 0 on purpose: zeroing the *hard* limit (rlim_max), not just
+    // the soft one, means a later compromised/unprivileged process can't raise it
+    // back — raising a hard limit needs CAP_SYS_RESOURCE, which we won't have once
+    // dropped (and PR_SET_NO_NEW_PRIVS stops us regaining caps via exec).
     unsafe {
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         let zero = libc::rlimit {
