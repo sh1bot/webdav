@@ -75,12 +75,10 @@ impl Auth {
             Some(h) => h,
             None => return false,
         };
-        let encoded = match header
-            .strip_prefix("Basic ")
-            .or_else(|| header.strip_prefix("basic "))
-        {
-            Some(e) => e.trim(),
-            None => return false,
+        // The auth scheme is case-insensitive (RFC 7617).
+        let encoded = match header.split_once(' ') {
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("Basic") => rest.trim(),
+            _ => return false,
         };
         let decoded = match base64_decode(encoded) {
             Some(d) => d,

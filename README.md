@@ -243,10 +243,14 @@ curl -X PROPFIND -H 'Depth: 1' \
 
 ### Mounting from a desktop client
 
-Most WebDAV clients (macOS Finder, GNOME Files / `davfs2`, Cyberduck,
-WinSCP, …) can present a client certificate. You typically import
-`client.crt` + `client.key` (often bundled as a PKCS#12 / `.p12` file) into the
-OS keychain and trust `ca.crt`. To make a `.p12` for import:
+This server advertises only `DAV: 1` (no locking/class 2) and is read-only, which
+GUI file managers handle unevenly: **Windows Explorer** generally refuses to mount
+a class-1 server, and **macOS Finder** may decline or behave erratically.
+Command-line and sync clients — `curl`, `davfs2`, `rclone`, Cyberduck — work well.
+
+Whichever client you use, it must present a client certificate if stunnel requires
+one. You typically import `client.crt` + `client.key` (often bundled as a
+PKCS#12 / `.p12` file) into the OS keychain and trust `ca.crt`. To make a `.p12`:
 
 ```sh
 openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
@@ -268,8 +272,10 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
   no PUT/DELETE/etc.). The process itself only writes the operator-specified
   `--log-file`.
 - Symlinks under `--root` are followed, but a symlink whose target resolves
-  *outside* the served root is refused (`403`) and omitted from listings, so it
-  can't be used to escape the root. (After a successful `chroot` this is moot —
+  *outside* the served root is reported as `404` (indistinguishable from a missing
+  file, so the response doesn't reveal the confinement) and omitted from listings,
+  so it can't be used to escape the root. A `..` in the request path is likewise
+  `404`. (After a successful `chroot` this is moot —
   nothing outside the root exists.)
 - **Started as root, tiny-webdav confines itself** — see *Confinement* above: it
   `chroot`s into `--root` and drops to the `--run-as` user (default `nobody`),

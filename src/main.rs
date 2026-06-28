@@ -153,9 +153,6 @@ fn serve_stdin(_root: &Path, _auth: &Auth) {
     process::exit(1);
 }
 
-#[cfg(not(unix))]
-fn redirect_streams(_log_file: Option<&Path>) {}
-
 fn main() {
     let args = parse_args();
 
@@ -236,9 +233,7 @@ fn main() {
     let client_cert = std::env::var("SSL_CLIENT_DN").is_ok_and(|v| !v.is_empty());
     if !auth.is_enabled() && !client_cert {
         eprintln!(
-            "WARNING: unauthenticated request — no verified client certificate \
-             (SSL_CLIENT_DN unset) and no HTTP Basic auth; anyone who can reach \
-             this server can read the served files."
+            "WARNING: serving unauthenticated — no client cert (SSL_CLIENT_DN) and no Basic auth"
         );
     }
 
@@ -249,6 +244,20 @@ fn main() {
 fn fatal(msg: &str) -> ! {
     eprintln!("fatal: {}", msg);
     process::exit(1);
+}
+
+/// Set both the soft and **hard** limit of `resource` to 0. Zeroing the *hard*
+/// limit is deliberate: a later unprivileged/compromised process can't raise it
+/// back (raising a hard limit needs CAP_SYS_RESOURCE, which we won't have once
+/// dropped, and PR_SET_NO_NEW_PRIVS blocks regaining caps via exec). Best-effort:
+/// a failure leaves us no more privileged.
+#[cfg(unix)]
+fn deny_rlimit(resource: libc::c_int) {
+    let zero = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe { libc::setrlimit(resource as _, &zero) };
 }
 
 /// Confine the process and shed privileges. Some hardening applies always (it
@@ -272,19 +281,10 @@ fn lower_privileges(root: &Path, run_as: Option<&str>) -> PathBuf {
 
     // Hardening that needs no privilege and is safe before any uid change.
     // Best-effort: failures here don't leave us *more* privileged.
-    //
-    // Both fields are 0 on purpose: zeroing the *hard* limit (rlim_max), not just
-    // the soft one, means a later compromised/unprivileged process can't raise it
-    // back — raising a hard limit needs CAP_SYS_RESOURCE, which we won't have once
-    // dropped (and PR_SET_NO_NEW_PRIVS stops us regaining caps via exec).
     unsafe {
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-        let zero = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        libc::setrlimit(libc::RLIMIT_CORE, &zero); // no core dumps (could leak data)
     }
+    deny_rlimit(libc::RLIMIT_CORE as _); // no core dumps (could leak data)
 
     let euid = unsafe { libc::geteuid() };
     let target = run_as.unwrap_or("nobody");
@@ -312,20 +312,22 @@ fn lower_privileges(root: &Path, run_as: Option<&str>) -> PathBuf {
                 fatal(&format!("chdir(/) failed: {}", io::Error::last_os_error()));
             }
             // Drop supplementary groups, then gid, then uid — order matters, and
-            // any failure is fatal so we never keep a shred of root.
+            // any failure is fatal so we never keep a shred of root. setres*id
+            // sets the real, effective AND saved ids in one call, so there's no
+            // leftover saved-uid 0 a later exploit could setuid() back to.
             if libc::setgroups(0, std::ptr::null()) != 0 {
                 fatal(&format!("setgroups failed: {}", io::Error::last_os_error()));
             }
-            if libc::setgid(gid) != 0 {
+            if libc::setresgid(gid, gid, gid) != 0 {
                 fatal(&format!(
-                    "setgid({}) failed: {}",
+                    "setresgid({}) failed: {}",
                     gid,
                     io::Error::last_os_error()
                 ));
             }
-            if libc::setuid(uid) != 0 {
+            if libc::setresuid(uid, uid, uid) != 0 {
                 fatal(&format!(
-                    "setuid({}) failed: {}",
+                    "setresuid({}) failed: {}",
                     uid,
                     io::Error::last_os_error()
                 ));
@@ -340,33 +342,30 @@ fn lower_privileges(root: &Path, run_as: Option<&str>) -> PathBuf {
 
     // Forbid forking, done *after* any uid change: setuid to a user already at
     // its RLIMIT_NPROC can fail, and we never fork anyway.
-    unsafe {
-        let zero = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        libc::setrlimit(libc::RLIMIT_NPROC, &zero);
-    }
+    deny_rlimit(libc::RLIMIT_NPROC as _);
 
-    // Assert the privilege outcome. We must never end up serving as root.
-    let now = unsafe { libc::geteuid() };
+    // Assert the privilege outcome by reading back the real, effective AND saved
+    // uids. We must never end up with any of them as root.
+    let (mut ruid, mut euid_now, mut suid) = (0, 0, 0);
+    unsafe { libc::getresuid(&mut ruid, &mut euid_now, &mut suid) };
     match run_as {
-        // --run-as given: we must actually be that user now (whether we just
-        // dropped to it, or were already running as it). Also covers the case
-        // where it couldn't be honoured because we weren't root.
+        // --run-as given: all three uids must actually be that user now (whether
+        // we just dropped to it, or were already running as it). Also covers the
+        // case where it couldn't be honoured because we weren't root.
         Some(name) => {
             let (uid, _gid) = creds.unwrap();
-            if now != uid {
+            if (ruid, euid_now, suid) != (uid, uid, uid) {
                 fatal(&format!(
-                    "--run-as {:?}: cannot run as that user (euid {} != {}; not root)",
-                    name, now, uid
+                    "--run-as {:?}: not that user (uids r={} e={} s={}, want {})",
+                    name, ruid, euid_now, suid, uid
                 ));
             }
         }
-        // No target requested: at minimum we must not be root. (Guards against a
-        // misconfigured `nobody` mapped to uid 0, where setuid would be a no-op.)
+        // No target requested: at minimum none of the uids may be root. (Guards
+        // against a misconfigured `nobody` mapped to uid 0 — where the drop is a
+        // no-op — and against a leftover saved-uid 0.)
         None => {
-            if now == 0 {
+            if ruid == 0 || euid_now == 0 || suid == 0 {
                 fatal("refusing to serve as root; run unprivileged or pass --run-as");
             }
         }

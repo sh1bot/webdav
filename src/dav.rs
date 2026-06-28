@@ -25,11 +25,13 @@ pub fn handle<S: Write + AsRawFd>(
         return auth.challenge(stream);
     }
 
-    // Percent-decode and sanitise the request path before touching disk.
+    // Percent-decode and sanitise the request path before touching disk. A `..`
+    // escape is reported as 404 (not 403), like an out-of-root symlink, so the
+    // response never reveals that the traversal filter (or a chroot) is in play.
     let decoded = util::percent_decode(&req.path);
     let fs_path = match util::resolve_within(root, &decoded) {
         Some(p) => p,
-        None => return http::write_status(stream, 403, "Forbidden"),
+        None => return http::write_status(stream, 404, "Not Found"),
     };
 
     match req.method.as_str() {
@@ -74,16 +76,10 @@ fn get_or_head<S: Write + AsRawFd>(
     req: &Request,
     send_body: bool,
 ) -> io::Result<()> {
-    let meta = match fs::metadata(fs_path) {
-        Ok(m) => m,
-        Err(e) => return err_status(stream, &e),
+    let meta = match stat_within_root(stream, root, fs_path)? {
+        Some(m) => m,
+        None => return Ok(()),
     };
-    // A symlink target outside the root is treated as Not Found, exactly as it
-    // would be once chrooted (where it simply doesn't exist) — so the response
-    // never reveals whether the server is chrooted.
-    if !within_root(root, fs_path) {
-        return http::write_status(stream, 404, "Not Found");
-    }
 
     if meta.is_dir() {
         // GET on a collection returns a simple HTML index for browsers.
@@ -216,6 +212,25 @@ fn stream_file<S: Write + AsRawFd>(
     Ok(())
 }
 
+/// `stat` the target and confine it to `root` in one place, so every handler
+/// applies the same gate. On success returns the metadata; on any failure writes
+/// the response (404/403/500, with an out-of-root target mapped to 404 so the
+/// chroot status isn't revealed) and returns `None`.
+fn stat_within_root<S: Write>(
+    stream: &mut S,
+    root: &Path,
+    fs_path: &Path,
+) -> io::Result<Option<fs::Metadata>> {
+    let meta = match fs::metadata(fs_path) {
+        Ok(m) => m,
+        Err(e) => return err_status(stream, &e).map(|()| None),
+    };
+    if !within_root(root, fs_path) {
+        return http::write_status(stream, 404, "Not Found").map(|()| None);
+    }
+    Ok(Some(meta))
+}
+
 /// Map a filesystem error to the appropriate HTTP status response.
 fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
     match e.kind() {
@@ -226,9 +241,13 @@ fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
 }
 
 /// True if `fs_path`, fully resolved (following symlinks), is still inside
-/// `root`. When the server has chrooted, `root` is `/` and this is always true;
-/// otherwise it stops a symlink under the served tree from escaping it.
+/// `root`. When the server has chrooted, `root` is `/` so nothing can be outside
+/// it — short-circuit and skip the per-path `canonicalize`. Otherwise resolve and
+/// check the prefix, which stops a symlink under the served tree from escaping.
 fn within_root(root: &Path, fs_path: &Path) -> bool {
+    if root == Path::new("/") {
+        return true;
+    }
     match fs_path.canonicalize() {
         Ok(real) => real.starts_with(root),
         Err(_) => false,
@@ -459,15 +478,10 @@ fn propfind<S: Write>(
     fs_path: &Path,
     req: &Request,
 ) -> io::Result<()> {
-    let meta = match fs::metadata(fs_path) {
-        Ok(m) => m,
-        Err(e) => return err_status(stream, &e),
+    let meta = match stat_within_root(stream, root, fs_path)? {
+        Some(m) => m,
+        None => return Ok(()),
     };
-    // Treat an out-of-root target as Not Found (see get_or_head): the response
-    // must not reveal whether the server is chrooted.
-    if !within_root(root, fs_path) {
-        return http::write_status(stream, 404, "Not Found");
-    }
 
     // Depth: 0 => just this resource; 1 => this resource + immediate children.
     let depth = req.header("depth").unwrap_or("1").trim();
@@ -535,10 +549,11 @@ fn response_xml(href_path: &str, meta: &fs::Metadata, fs_path: &Path) -> String 
     let is_dir = meta.is_dir();
 
     // Collections must end with a trailing slash in their href.
-    let mut href = href_path.to_string();
-    if is_dir && !href.ends_with('/') {
-        href.push('/');
-    }
+    let href = if is_dir {
+        util::with_trailing_slash(href_path)
+    } else {
+        href_path.to_string()
+    };
     let href = util::percent_encode_path(&href);
 
     let display = fs_path
@@ -576,6 +591,10 @@ fn response_xml(href_path: &str, meta: &fs::Metadata, fs_path: &Path) -> String 
             "        <D:getcontenttype>{}</D:getcontenttype>\n",
             util::mime_for(fs_path)
         ));
+        // Same strong validator GET sends as ETag; the value has no XML specials.
+        if let Some(etag) = etag_for(meta) {
+            block.push_str(&format!("        <D:getetag>{}</D:getetag>\n", etag));
+        }
     }
     block.push_str("      </D:prop>\n");
     block.push_str("      <D:status>HTTP/1.1 200 OK</D:status>\n");
