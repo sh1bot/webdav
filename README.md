@@ -282,6 +282,10 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
   drop is fatal. The served files (and any `--auth-file`) must be readable by that
   user. If stunnel drops privileges itself instead, tiny-webdav runs unprivileged
   and skips this.
+- **It refuses to serve as root.** After confinement it asserts the outcome: with
+  `--run-as`, that it is actually that user now (else fatal — e.g. it was given
+  but the process is neither root nor already that user); without `--run-as`, that
+  it is at least not uid 0 (guarding against a `nobody` misconfigured to uid 0).
 - **Defense-in-depth:** regardless of who drops privileges, tiny-webdav sets
   `PR_SET_NO_NEW_PRIVS` and zeroes `RLIMIT_CORE` and `RLIMIT_NPROC` — so it can't
   gain privileges via a later `exec`, can't dump core (which might leak file

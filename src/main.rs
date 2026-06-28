@@ -40,7 +40,7 @@ struct Args {
     password: Option<String>,
     realm: String,
     log_file: Option<PathBuf>,
-    run_as: String,
+    run_as: Option<String>,
 }
 
 fn usage() -> ! {
@@ -75,7 +75,7 @@ fn parse_args() -> Args {
     let mut password: Option<String> = None;
     let mut realm = "tiny-webdav".to_string();
     let mut log_file: Option<PathBuf> = None;
-    let mut run_as = "nobody".to_string();
+    let mut run_as: Option<String> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -86,7 +86,7 @@ fn parse_args() -> Args {
             "--password" => password = Some(it.next().unwrap_or_else(|| usage())),
             "--realm" => realm = it.next().unwrap_or_else(|| usage()),
             "--log-file" => log_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
-            "--run-as" => run_as = it.next().unwrap_or_else(|| usage()),
+            "--run-as" => run_as = Some(it.next().unwrap_or_else(|| usage())),
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("error: unexpected argument '{}'\n", other);
@@ -218,7 +218,7 @@ fn main() {
     // chroot into the served directory and drop to `nobody`; the returned path is
     // what we serve from ("/" once chrooted). If we aren't root (e.g. stunnel
     // already dropped us), this is a no-op and we serve the canonical root as-is.
-    let serve_root = lower_privileges(&canonical_root, &args.run_as);
+    let serve_root = lower_privileges(&canonical_root, args.run_as.as_deref());
 
     // Now unprivileged: parse the (already-open) auth file and inline credentials.
     let auth = match build_auth(&args, auth_file) {
@@ -256,15 +256,17 @@ fn fatal(msg: &str) -> ! {
 /// from here on, and `RLIMIT_CORE`/`RLIMIT_NPROC` caps (no core dumps, no
 /// forking) to bound the blast radius of any bug.
 ///
-/// When started as root we additionally confine to `root`: look up the `run_as`
-/// account (reading `/etc/passwd` *before* the chroot, while it's reachable),
-/// `chroot` into `root`, `chdir` to the new `/`, then drop supplementary groups,
-/// gid and uid (in that order) to that account's ids. A failure while root is
-/// fatal — we must never continue with elevated privileges. Returns the path to
-/// serve from afterwards: `/` once chrooted, or `root` unchanged when we weren't
-/// root (e.g. stunnel already dropped us).
+/// When started as root we confine to `root`: `chroot` into it, `chdir` to the
+/// new `/`, and drop supplementary groups, gid and uid to the target account
+/// (`run_as`, default `nobody`), whose ids are resolved *before* the chroot while
+/// `/etc/passwd` is reachable. Any failure while root is fatal.
+///
+/// Finally, if `--run-as` was given explicitly, *assert* we actually ended up as
+/// that user — this catches the case where we couldn't change uid (not root) and
+/// weren't already running as it. Returns the path to serve from: `/` once
+/// chrooted, else `root` unchanged.
 #[cfg(unix)]
-fn lower_privileges(root: &Path, run_as: &str) -> PathBuf {
+fn lower_privileges(root: &Path, run_as: Option<&str>) -> PathBuf {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -284,21 +286,17 @@ fn lower_privileges(root: &Path, run_as: &str) -> PathBuf {
         libc::setrlimit(libc::RLIMIT_CORE, &zero); // no core dumps (could leak data)
     }
 
-    let serve_root = if unsafe { libc::geteuid() } == 0 {
-        // Resolve the target account before chrooting, while /etc/passwd is
-        // reachable. A named user that doesn't exist is a fatal config error — we
-        // won't guess a uid to drop to.
-        let c_user = CString::new(run_as)
-            .unwrap_or_else(|_| fatal("--run-as contains an interior NUL byte"));
-        let (uid, gid) = unsafe {
-            let pw = libc::getpwnam(c_user.as_ptr());
-            if pw.is_null() {
-                fatal(&format!("--run-as user {:?} not found", run_as));
-            } else {
-                ((*pw).pw_uid, (*pw).pw_gid)
-            }
-        };
+    let euid = unsafe { libc::geteuid() };
+    let target = run_as.unwrap_or("nobody");
 
+    // Resolve the target account *before* any chroot (while /etc/passwd is
+    // reachable), if we'll need it — to drop to (when root) or to assert against
+    // (when --run-as was given). Cached so the post-drop assertion needn't re-read
+    // /etc/passwd, which is gone once chrooted.
+    let creds = (euid == 0 || run_as.is_some()).then(|| lookup_user(target));
+
+    let serve_root = if euid == 0 {
+        let (uid, gid) = creds.unwrap();
         let c_root = CString::new(root.as_os_str().as_bytes())
             .unwrap_or_else(|_| fatal("root path contains an interior NUL byte"));
 
@@ -336,7 +334,7 @@ fn lower_privileges(root: &Path, run_as: &str) -> PathBuf {
 
         PathBuf::from("/")
     } else {
-        // Not root: nothing to chroot/drop (the supervisor may already have).
+        // Not root: can't chroot or change uid (the supervisor may already have).
         root.to_path_buf()
     };
 
@@ -350,10 +348,50 @@ fn lower_privileges(root: &Path, run_as: &str) -> PathBuf {
         libc::setrlimit(libc::RLIMIT_NPROC, &zero);
     }
 
+    // Assert the privilege outcome. We must never end up serving as root.
+    let now = unsafe { libc::geteuid() };
+    match run_as {
+        // --run-as given: we must actually be that user now (whether we just
+        // dropped to it, or were already running as it). Also covers the case
+        // where it couldn't be honoured because we weren't root.
+        Some(name) => {
+            let (uid, _gid) = creds.unwrap();
+            if now != uid {
+                fatal(&format!(
+                    "--run-as {:?}: cannot run as that user (euid {} != {}; not root)",
+                    name, now, uid
+                ));
+            }
+        }
+        // No target requested: at minimum we must not be root. (Guards against a
+        // misconfigured `nobody` mapped to uid 0, where setuid would be a no-op.)
+        None => {
+            if now == 0 {
+                fatal("refusing to serve as root; run unprivileged or pass --run-as");
+            }
+        }
+    }
+
     serve_root
 }
 
 #[cfg(not(unix))]
-fn lower_privileges(root: &Path, _run_as: &str) -> PathBuf {
+fn lower_privileges(root: &Path, _run_as: Option<&str>) -> PathBuf {
     root.to_path_buf()
+}
+
+/// Resolve a user name to its (uid, primary gid) via `getpwnam`. Fatal if the
+/// name is unknown or contains a NUL. Must be called before any chroot, while
+/// `/etc/passwd` is reachable.
+#[cfg(unix)]
+fn lookup_user(name: &str) -> (libc::uid_t, libc::gid_t) {
+    use std::ffi::CString;
+
+    let c_name =
+        CString::new(name).unwrap_or_else(|_| fatal("user name contains an interior NUL byte"));
+    let pw = unsafe { libc::getpwnam(c_name.as_ptr()) };
+    if pw.is_null() {
+        fatal(&format!("user {:?} not found", name));
+    }
+    unsafe { ((*pw).pw_uid, (*pw).pw_gid) }
 }
