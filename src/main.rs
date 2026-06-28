@@ -226,69 +226,97 @@ fn fatal(msg: &str) -> ! {
     process::exit(1);
 }
 
-/// When started as root, confine the process to `root`: look up the `nobody`
-/// account, `chroot` into `root`, `chdir` to the new `/`, then drop supplementary
-/// groups, gid and uid (in that order). The `nobody` ids are resolved *before*
-/// the chroot, while `/etc/passwd` is still reachable. Returns the path to serve
-/// from afterwards: `/` once chrooted, or `root` unchanged when we weren't root
-/// (e.g. stunnel already dropped privileges). A failure while root is fatal — we
-/// must never continue with elevated privileges.
+/// Confine the process and shed privileges. Some hardening applies always (it
+/// needs no privilege): `PR_SET_NO_NEW_PRIVS` so we can never *gain* privileges
+/// from here on, and `RLIMIT_CORE`/`RLIMIT_NPROC` caps (no core dumps, no
+/// forking) to bound the blast radius of any bug.
+///
+/// When started as root we additionally confine to `root`: look up the `nobody`
+/// account (reading `/etc/passwd` *before* the chroot, while it's reachable),
+/// `chroot` into `root`, `chdir` to the new `/`, then drop supplementary groups,
+/// gid and uid (in that order). A failure while root is fatal — we must never
+/// continue with elevated privileges. Returns the path to serve from afterwards:
+/// `/` once chrooted, or `root` unchanged when we weren't root (e.g. stunnel
+/// already dropped us).
 #[cfg(unix)]
 fn lower_privileges(root: &Path) -> PathBuf {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    // Not root: nothing to confine/drop (the supervisor may already have).
-    if unsafe { libc::geteuid() } != 0 {
-        return root.to_path_buf();
+    // Hardening that needs no privilege and is safe before any uid change.
+    // Best-effort: failures here don't leave us *more* privileged.
+    unsafe {
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_CORE, &zero); // no core dumps (could leak data)
     }
 
-    // Resolve `nobody` before chrooting, while /etc/passwd is reachable.
-    let (uid, gid) = unsafe {
-        let pw = libc::getpwnam(c"nobody".as_ptr());
-        if pw.is_null() {
-            (65534, 65534) // conventional nobody / nogroup ids
-        } else {
-            ((*pw).pw_uid, (*pw).pw_gid)
+    let serve_root = if unsafe { libc::geteuid() } == 0 {
+        // Resolve `nobody` before chrooting, while /etc/passwd is reachable.
+        let (uid, gid) = unsafe {
+            let pw = libc::getpwnam(c"nobody".as_ptr());
+            if pw.is_null() {
+                (65534, 65534) // conventional nobody / nogroup ids
+            } else {
+                ((*pw).pw_uid, (*pw).pw_gid)
+            }
+        };
+
+        let c_root = CString::new(root.as_os_str().as_bytes())
+            .unwrap_or_else(|_| fatal("root path contains an interior NUL byte"));
+
+        unsafe {
+            if libc::chroot(c_root.as_ptr()) != 0 {
+                fatal(&format!(
+                    "chroot to {} failed: {}",
+                    root.display(),
+                    io::Error::last_os_error()
+                ));
+            }
+            if libc::chdir(c"/".as_ptr()) != 0 {
+                fatal(&format!("chdir(/) failed: {}", io::Error::last_os_error()));
+            }
+            // Drop supplementary groups, then gid, then uid — order matters, and
+            // any failure is fatal so we never keep a shred of root.
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                fatal(&format!("setgroups failed: {}", io::Error::last_os_error()));
+            }
+            if libc::setgid(gid) != 0 {
+                fatal(&format!(
+                    "setgid({}) failed: {}",
+                    gid,
+                    io::Error::last_os_error()
+                ));
+            }
+            if libc::setuid(uid) != 0 {
+                fatal(&format!(
+                    "setuid({}) failed: {}",
+                    uid,
+                    io::Error::last_os_error()
+                ));
+            }
         }
+
+        PathBuf::from("/")
+    } else {
+        // Not root: nothing to chroot/drop (the supervisor may already have).
+        root.to_path_buf()
     };
 
-    let c_root = CString::new(root.as_os_str().as_bytes())
-        .unwrap_or_else(|_| fatal("root path contains an interior NUL byte"));
-
+    // Forbid forking, done *after* any uid change: setuid to a user already at
+    // its RLIMIT_NPROC can fail, and we never fork anyway.
     unsafe {
-        if libc::chroot(c_root.as_ptr()) != 0 {
-            fatal(&format!(
-                "chroot to {} failed: {}",
-                root.display(),
-                io::Error::last_os_error()
-            ));
-        }
-        if libc::chdir(c"/".as_ptr()) != 0 {
-            fatal(&format!("chdir(/) failed: {}", io::Error::last_os_error()));
-        }
-        // Drop supplementary groups, then gid, then uid — order matters, and any
-        // failure is fatal so we never keep a shred of root.
-        if libc::setgroups(0, std::ptr::null()) != 0 {
-            fatal(&format!("setgroups failed: {}", io::Error::last_os_error()));
-        }
-        if libc::setgid(gid) != 0 {
-            fatal(&format!(
-                "setgid({}) failed: {}",
-                gid,
-                io::Error::last_os_error()
-            ));
-        }
-        if libc::setuid(uid) != 0 {
-            fatal(&format!(
-                "setuid({}) failed: {}",
-                uid,
-                io::Error::last_os_error()
-            ));
-        }
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_NPROC, &zero);
     }
 
-    PathBuf::from("/")
+    serve_root
 }
 
 #[cfg(not(unix))]

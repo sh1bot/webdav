@@ -147,6 +147,11 @@ opened *before* the chroot — the binary is already in memory (and static), the
 (under `--root`, now `/`) are touched. A failed drop while root is fatal — the
 server will not run with elevated privileges.
 
+As defense-in-depth — applied whether or not it does the chroot/drop itself —
+tiny-webdav also sets `PR_SET_NO_NEW_PRIVS` (it can never *gain* privileges
+afterwards, e.g. via a setuid-bit `exec`) and zeroes `RLIMIT_CORE` and
+`RLIMIT_NPROC` (no core dumps that could leak file data, and no forking).
+
 If you'd rather have **stunnel** do the confinement instead (its `chroot` /
 `setuid` / `setgid`), that also works: tiny-webdav then runs already-unprivileged
 and skips its own step — but you'd have to place the static binary inside
@@ -274,5 +279,10 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
   they can live outside the served tree. A failed drop is fatal. The served files
   (and any `--auth-file`) must be readable by `nobody`. If stunnel drops
   privileges itself instead, tiny-webdav runs unprivileged and skips this.
+- **Defense-in-depth:** regardless of who drops privileges, tiny-webdav sets
+  `PR_SET_NO_NEW_PRIVS` and zeroes `RLIMIT_CORE` and `RLIMIT_NPROC` — so it can't
+  gain privileges via a later `exec`, can't dump core (which might leak file
+  data), and can't fork. seccomp syscall filtering is deliberately *not* used, to
+  avoid a brittle allowlist; the above plus the chroot/uid drop are the confines.
 - The example certificates from `gen-certs.sh` are for testing only. Use your
   own PKI in production and keep private keys readable only by their owner.
