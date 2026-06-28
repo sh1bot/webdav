@@ -1,40 +1,21 @@
-; Example stunnel configuration for tiny-webdav.
+; Example stunnel config for tiny-webdav.  Run:  stunnel /etc/stunnel/tiny-webdav.conf
 ;
-; stunnel terminates TLS (and, with `verify`, the client certificate), then runs
-; tiny-webdav with the decrypted connection on its stdin/stdout — the classic
-; inetd contract. stunnel forks one tiny-webdav process per connection, so you
-; do NOT need inetd/xinetd as well (though you can front stunnel with xinetd in
-; inetd mode if you prefer xinetd to own the listening socket).
-;
-;   stunnel /etc/stunnel/tiny-webdav.conf
-;
-; Run stunnel AS ROOT and do NOT set stunnel's own chroot/setuid here: tiny-webdav
-; confines itself when started as root (it chroots into --root and drops to
-; nobody). That keeps the served directory free of any jail scaffolding.
+; stunnel terminates TLS and execs one tiny-webdav per connection (plaintext on
+; stdin/stdout). Run it AS ROOT and do NOT set stunnel's own chroot/setuid —
+; tiny-webdav confines itself when started as root.
 
-; stunnel's own diagnostics (tiny-webdav logs separately via --log-file below).
 foreground = no
-output = /var/log/stunnel-tiny-webdav.log
+output = /var/log/stunnel-tiny-webdav.log   ; stunnel's own log
 
 [tiny-webdav]
 accept = 8443
-
-; --- Server identity presented to clients ---
 cert = /etc/tiny-webdav/server.crt
 key  = /etc/tiny-webdav/server.key
 
-; --- Client-certificate auth (mutual TLS) ---
-; verify = 2 requires every client to present a certificate signed by a CA in
-; CAfile. Delete these two lines to disable client-cert auth and rely on
-; tiny-webdav's HTTP Basic auth (and/or the network) instead.
+; Client-certificate auth: require a cert signed by a CA in CAfile.
+; Delete these two lines to rely on tiny-webdav's HTTP Basic auth instead.
 CAfile = /etc/tiny-webdav/ca.crt
 verify = 2
 
-; --- Run tiny-webdav per connection, speaking plaintext on stdin/stdout ---
-; Started as root, tiny-webdav chroots into --root and drops to nobody itself.
-; The binary, --auth-file and --log-file are all outside --root and are loaded
-; before the chroot; the served files must be readable by nobody.
-; tiny-webdav logs to stderr, which stunnel passes through to its own stderr —
-; the systemd journal (journalctl -u stunnel) when stunnel runs as a service.
 exec     = /usr/local/bin/tiny-webdav
 execargs = tiny-webdav --root /srv/files --auth-file /etc/tiny-webdav/users.txt

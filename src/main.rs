@@ -1,24 +1,11 @@
-//! tiny-webdav: a read-only WebDAV server run under inetd / xinetd, with TLS
-//! terminated by **stunnel** in front of it.
+//! tiny-webdav: a small read-only WebDAV server, run behind stunnel (which
+//! terminates TLS) under the inetd contract — the decrypted connection arrives on
+//! stdin (fd 0); we serve one request and exit.
 //!
-//! This program speaks *plaintext* HTTP. It does not do TLS itself: stunnel
-//! terminates TLS (and verifies client certificates, if configured), then hands
-//! us the decrypted connection on stdin (fd 0) — the classic inetd contract.
-//! We serve the one request and exit, so stunnel/inetd gives per-connection
-//! concurrency (one process per client) for free.
-//!
-//! Access control splits across the two layers: **client certificate (mutual
-//! TLS)** is enforced by stunnel (`verify`/`CAfile`, which we never see), while
-//! **HTTP Basic username/password** is enforced here, layered on top. If no
-//! Basic credentials are configured, this program enforces no auth of its own
-//! and relies entirely on stunnel / the network for access control.
-//!
-//! Confinement: if stunnel execs us as root, we chroot into the served directory
-//! and drop to `nobody` ourselves (after reading any command-line files, so they
-//! can live outside the chroot). Because the static binary is already in memory
-//! and `/etc/passwd` is read before the chroot, the served directory needs
-//! nothing added to it. If stunnel already dropped privileges (its own `setuid`),
-//! we run unprivileged and this step is a no-op.
+//! Auth is layered: client certificates are stunnel's job (we only see the
+//! resulting `SSL_CLIENT_DN`), HTTP Basic is ours. Confinement is ours too: run
+//! as root we chroot into `--root` and drop to `--run-as` (see `lower_privileges`).
+//! See the README for the full picture.
 
 mod auth;
 mod dav;
@@ -45,11 +32,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "tiny-webdav — read-only WebDAV, run under inetd/xinetd behind stunnel\n\n\
-         It speaks plaintext HTTP on a connection passed on stdin (fd 0) and\n\
-         exits. Put stunnel in front to terminate TLS (and verify client certs);\n\
-         launch it per-connection from stunnel's exec/execargs or from\n\
-         inetd/xinetd in 'nowait' mode.\n\n\
+        "tiny-webdav — read-only WebDAV over plaintext HTTP, run behind stunnel\n\n\
          USAGE:\n  \
            tiny-webdav [--root <dir>] [options]\n\n\
          OPTIONS:\n  \

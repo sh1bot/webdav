@@ -432,11 +432,7 @@ fn directory_index_html(root: &Path, decoded_path: &str, fs_path: &Path) -> Stri
     html.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">");
     html.push_str(&format!("<title>Index of {}</title>", title));
     html.push_str(
-        "<style>body{font-family:sans-serif;margin:1.5rem}\
-         h1{font-size:1.1rem}table{border-collapse:collapse}\
-         th,td{text-align:left;padding:.2rem 1.2rem .2rem 0;white-space:nowrap}\
-         th{border-bottom:1px solid #ccc}td.size{text-align:right;font-variant-numeric:tabular-nums}\
-         td.date{font-variant-numeric:tabular-nums;color:#444}</style></head><body>",
+        "<style>body{font-family:sans-serif}td,th{text-align:left;padding:0 1.5rem 0 0}</style></head><body>",
     );
     html.push_str(&format!("<h1>Index of {}</h1>", title));
     html.push_str(
@@ -459,7 +455,7 @@ fn directory_index_html(root: &Path, decoded_path: &str, fs_path: &Path) -> Stri
             util::human_size(e.len)
         };
         html.push_str(&format!(
-            "<tr><td><a href=\"{}\">{}{}</a></td><td class=\"date\">{}</td><td class=\"size\">{}</td></tr>",
+            "<tr><td><a href=\"{}\">{}{}</a></td><td>{}</td><td>{}</td></tr>",
             href,
             util::xml_escape(&e.name),
             suffix,
