@@ -32,6 +32,10 @@ never an access decision.)
   `If-Range`).
 - Bodies sent with `sendfile(2)` — straight from page cache to socket, constant
   memory even for huge files.
+- Persistent connections (HTTP/1.1 keep-alive): one connection serves many
+  requests, capped by `--max-requests` and an idle `--timeout`. Every response is
+  `Content-Length`-framed; if a request's body framing is ever uncertain the
+  connection is closed rather than risk a desync.
 - Mutating methods (`PUT`, `DELETE`, `MKCOL`, …) → `405`.
 - Path traversal (`..`) and out-of-root symlinks are rejected (as `404`).
 - Run as root, it `chroot`s into `--root` and drops privileges (see below).
@@ -88,6 +92,8 @@ stderr (the systemd journal) — fine here.
 | `--auth-file` | File of `username:password` lines (`#` comments; password may contain `:`) | *(none)* |
 | `--user` / `--password` | A single inline credential | *(none)* |
 | `--realm` | Basic-auth realm | `tiny-webdav` |
+| `--timeout` | Per-read/write timeout in seconds, incl. the wait for the next keep-alive request (`0` disables) | `30` |
+| `--max-requests` | Max requests served on one connection before closing (`0` = unlimited) | `100` |
 
 Client certificates are configured in stunnel, not here.
 
@@ -149,9 +155,10 @@ tiny-webdav runs unprivileged and skips this step.
   high-traffic fileserver.
 - **TLS, ciphers, and client-cert verification are stunnel's job** — keep it
   patched; tiny-webdav contains no TLS code.
-- Concurrency, connection caps, and slow-client timeouts are stunnel's job too
-  (`TIMEOUTidle`/`TIMEOUTbusy`, `per_source`); tiny-webdav has no timeouts — a
-  hung connection only ties up its own process.
+- Concurrency and connection caps are stunnel's job (`per_source`,
+  `TIMEOUTidle`/`TIMEOUTbusy`). tiny-webdav adds only a best-effort per-socket
+  read/write `--timeout` so an idle kept-alive connection can't pin its process
+  forever; a hung connection still only ties up its own process.
 - "Read-only" means no request can modify the served tree; the process only ever
   writes the operator's `--log-file`.
 - Example certs from `gen-certs.sh` are for testing only; use your own PKI in

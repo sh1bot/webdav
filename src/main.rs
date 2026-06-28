@@ -28,6 +28,8 @@ struct Args {
     realm: String,
     log_file: Option<PathBuf>,
     run_as: Option<String>,
+    timeout: u64,
+    max_requests: u32,
 }
 
 fn usage() -> ! {
@@ -39,6 +41,10 @@ fn usage() -> ! {
            --root <dir>            Directory to serve (default: current directory)\n  \
            --run-as <user>         When started as root, chroot into --root and\n                          \
                        drop to this user (default: nobody)\n  \
+           --timeout <secs>        Per-read/write socket timeout, also bounding an\n                          \
+                       idle keep-alive connection (default: 30, 0 = none)\n  \
+           --max-requests <n>      Max requests per persistent connection\n                          \
+                       (default: 100, 0 = unlimited)\n  \
            --log-file <file>       Write diagnostics to this file. Default: stderr\n                          \
                        (captured by stunnel/systemd). Use this under xinetd,\n                          \
                        where stderr is the client socket.\n\n  \
@@ -59,17 +65,22 @@ fn parse_args() -> Args {
     let mut realm = "tiny-webdav".to_string();
     let mut log_file: Option<PathBuf> = None;
     let mut run_as: Option<String> = None;
+    let mut timeout: u64 = 30;
+    let mut max_requests: u32 = 100;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
+        let mut val = || it.next().unwrap_or_else(|| usage());
         match arg.as_str() {
-            "--root" => root = PathBuf::from(it.next().unwrap_or_else(|| usage())),
-            "--auth-file" => auth_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
-            "--user" => user = Some(it.next().unwrap_or_else(|| usage())),
-            "--password" => password = Some(it.next().unwrap_or_else(|| usage())),
-            "--realm" => realm = it.next().unwrap_or_else(|| usage()),
-            "--log-file" => log_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
-            "--run-as" => run_as = Some(it.next().unwrap_or_else(|| usage())),
+            "--root" => root = PathBuf::from(val()),
+            "--auth-file" => auth_file = Some(PathBuf::from(val())),
+            "--user" => user = Some(val()),
+            "--password" => password = Some(val()),
+            "--realm" => realm = val(),
+            "--log-file" => log_file = Some(PathBuf::from(val())),
+            "--run-as" => run_as = Some(val()),
+            "--timeout" => timeout = val().parse().unwrap_or_else(|_| usage()),
+            "--max-requests" => max_requests = val().parse().unwrap_or_else(|_| usage()),
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("error: unexpected argument '{}'\n", other);
@@ -91,6 +102,8 @@ fn parse_args() -> Args {
         realm,
         log_file,
         run_as,
+        timeout,
+        max_requests,
     }
 }
 
@@ -109,31 +122,68 @@ fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
     Ok(auth)
 }
 
-/// Serve the one request stunnel/inetd handed us. Per the inetd contract we read
-/// the request from stdin (fd 0), write the reply to stdout (fd 1), and log to
-/// stderr (fd 2) — without assuming any of them is a socket. (Under stunnel/xinetd
-/// they all refer to one connection, but nothing here relies on that.)
+/// Serve the connection stunnel/inetd handed us. Per the inetd contract we read
+/// requests from stdin (fd 0), write replies to stdout (fd 1), and log to stderr
+/// (fd 2) — without assuming any of them is a socket. The connection is reused
+/// for successive requests (HTTP keep-alive) until the client closes it, asks to
+/// close, an error/timeout occurs, or `--max-requests` is reached.
 #[cfg(unix)]
-fn serve_stdin(root: &Path, auth: &Auth) {
+fn serve_stdin(root: &Path, auth: &Auth, timeout: u64, max_requests: u32) {
+    use std::io::BufReader;
     use std::os::unix::io::FromRawFd;
 
-    // Safety: fd 0/1 are the inherited, owned connection descriptors. The File
-    // wrappers close them on drop — at process exit, after the one request.
-    let mut input = unsafe { File::from_raw_fd(0) };
+    // Safety: fd 0/1 are the inherited, owned connection descriptors; the File
+    // wrappers close them on drop, at process exit.
+    let input = unsafe { File::from_raw_fd(0) };
     let mut output = unsafe { File::from_raw_fd(1) };
 
-    let result = http::read_request(&mut input)
-        .and_then(|req| dav::handle(&mut output, root, auth, &req))
-        .and_then(|()| output.flush());
-    if let Err(e) = result {
-        eprintln!("connection error: {}", e);
+    // Bound how long a single read/write — including the wait for the next
+    // keep-alive request — may block. Best-effort: ignored on non-sockets.
+    if timeout != 0 {
+        set_socket_timeouts(timeout);
+    }
+
+    // BufReader gives us cheap byte-at-a-time header parsing (one syscall per
+    // bufferful) and holds any bytes already read past one request for the next.
+    let mut reader = BufReader::new(input);
+    let mut served: u32 = 0;
+    // EOF, a read timeout, or a malformed line ends the connection.
+    while let Ok(req) = http::read_request(&mut reader) {
+        served += 1;
+        let keep = req.keep_alive() && (max_requests == 0 || served < max_requests);
+        http::set_keep_alive(keep);
+
+        if let Err(e) = dav::handle(&mut output, root, auth, &req).and_then(|()| output.flush()) {
+            eprintln!("connection error: {}", e);
+            break;
+        }
+        if !keep {
+            break;
+        }
     }
 }
 
 #[cfg(not(unix))]
-fn serve_stdin(_root: &Path, _auth: &Auth) {
+fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64, _max_requests: u32) {
     eprintln!("error: tiny-webdav is only supported on Unix platforms");
     process::exit(1);
+}
+
+/// Best-effort `SO_RCVTIMEO` / `SO_SNDTIMEO` on the connection descriptors, so a
+/// slow or idle client can't pin the process forever. Any error (e.g. the fd
+/// isn't a socket) is ignored.
+#[cfg(unix)]
+fn set_socket_timeouts(secs: u64) {
+    let tv = libc::timeval {
+        tv_sec: secs as _,
+        tv_usec: 0,
+    };
+    let p = (&tv as *const libc::timeval).cast();
+    let len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    unsafe {
+        libc::setsockopt(0, libc::SOL_SOCKET, libc::SO_RCVTIMEO, p, len);
+        libc::setsockopt(1, libc::SOL_SOCKET, libc::SO_SNDTIMEO, p, len);
+    }
 }
 
 fn main() {
@@ -220,7 +270,7 @@ fn main() {
         );
     }
 
-    serve_stdin(&serve_root, &auth);
+    serve_stdin(&serve_root, &auth, args.timeout, args.max_requests);
 }
 
 /// Print a fatal error to stderr and exit non-zero.

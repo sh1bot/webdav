@@ -1,8 +1,10 @@
 //! A deliberately tiny HTTP/1.1 layer: just enough request parsing and
-//! response writing to serve read-only WebDAV. Every response sets
-//! `Connection: close`, so we handle exactly one request per connection and
-//! never have to worry about keep-alive framing.
+//! response writing to serve read-only WebDAV. Persistent connections are
+//! supported — the serve loop sets [`set_keep_alive`] per request and
+//! [`write_head`] emits the matching `Connection` header. Every response carries
+//! a `Content-Length`, so each one is self-delimiting on a kept-alive connection.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
@@ -13,16 +15,50 @@ use crate::util;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024; // PROPFIND bodies are tiny.
 
+thread_local! {
+    /// Whether the response now being written should keep the connection open.
+    /// Set once per request by the serve loop and read by `write_head`. The
+    /// process is single-threaded and handles one connection, so this is a
+    /// per-connection flag without threading it through every response helper.
+    static KEEP_ALIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set the connection disposition for subsequent responses (see [`write_head`]).
+pub fn set_keep_alive(v: bool) {
+    KEEP_ALIVE.with(|k| k.set(v));
+}
+
 pub struct Request {
     pub method: String,
     pub path: String,
+    pub version: String,
     /// Header names are stored lowercased for case-insensitive lookup.
     pub headers: HashMap<String, String>,
+    /// False if we couldn't determine the body boundary (oversized/unparseable
+    /// `Content-Length`, `Transfer-Encoding`, or a truncated body) — the stream
+    /// position is then unknown, so the connection must not be reused.
+    well_framed: bool,
 }
 
 impl Request {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).map(|s| s.as_str())
+    }
+
+    /// Whether this request permits a persistent connection: HTTP/1.1 unless it
+    /// asks to `close`, or HTTP/1.0 only if it asks to `keep-alive`. Always false
+    /// if the body framing was lost (see `well_framed`).
+    pub fn keep_alive(&self) -> bool {
+        if !self.well_framed {
+            return false;
+        }
+        let conn = self.header("connection").unwrap_or("");
+        let has = |tok: &str| conn.split(',').any(|t| t.trim().eq_ignore_ascii_case(tok));
+        if self.version.eq_ignore_ascii_case("HTTP/1.1") {
+            !has("close")
+        } else {
+            has("keep-alive")
+        }
     }
 }
 
@@ -61,6 +97,7 @@ pub fn read_request<S: Read>(stream: &mut S) -> io::Result<Request> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let raw_target = parts.next().unwrap_or("").to_string();
+    let version = parts.next().unwrap_or("HTTP/1.0").to_string();
 
     if method.is_empty() || raw_target.is_empty() {
         return Err(io::Error::new(
@@ -86,28 +123,38 @@ pub fn read_request<S: Read>(stream: &mut S) -> io::Result<Request> {
         }
     }
 
-    // Drain request body if present so the socket is clean.
-    if let Some(len) = headers
-        .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        let to_read = len.min(MAX_BODY_BYTES);
-        let mut remaining = to_read;
-        let mut sink = [0u8; 4096];
-        while remaining > 0 {
-            let want = remaining.min(sink.len());
-            let n = stream.read(&mut sink[..want])?;
-            if n == 0 {
-                break;
+    // Drain the request body so the stream is positioned at the next request.
+    // If we can't be sure where the body ends, leave `well_framed` false so the
+    // caller closes the connection instead of risking a desync.
+    let mut well_framed = true;
+    if headers.contains_key("transfer-encoding") {
+        // We don't decode chunked, so we can't find the next request boundary.
+        well_framed = false;
+    } else if let Some(cl) = headers.get("content-length") {
+        match cl.parse::<usize>() {
+            Ok(len) if len <= MAX_BODY_BYTES => {
+                let mut remaining = len;
+                let mut sink = [0u8; 4096];
+                while remaining > 0 {
+                    let want = remaining.min(sink.len());
+                    let n = stream.read(&mut sink[..want])?;
+                    if n == 0 {
+                        well_framed = false; // truncated body
+                        break;
+                    }
+                    remaining -= n;
+                }
             }
-            remaining -= n;
+            _ => well_framed = false, // oversized or unparseable
         }
     }
 
     Ok(Request {
         method,
         path,
+        version,
         headers,
+        well_framed,
     })
 }
 
@@ -160,7 +207,12 @@ pub fn write_head<S: Write>(
     }
     let _ = write!(head, "Date: {}\r\n", util::http_date(SystemTime::now()));
     head.push_str("Server: tiny-webdav\r\n");
-    head.push_str("Connection: close\r\n");
+    let alive = KEEP_ALIVE.with(|k| k.get());
+    head.push_str(if alive {
+        "Connection: keep-alive\r\n"
+    } else {
+        "Connection: close\r\n"
+    });
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())
 }
@@ -172,8 +224,9 @@ pub fn write_head<S: Write>(
 ///
 /// The kernel advances its own copy of the offset (the `off` pointer), so the
 /// file's cursor is untouched and ranges need no prior `seek`. A short transfer
-/// (fewer bytes than the declared length) means the file was truncated under us;
-/// we stop, and `Connection: close` framing bounds the response.
+/// (the file was truncated under us, so we can't deliver the `Content-Length` we
+/// promised) is an error: the framing is broken, so the caller must close the
+/// connection rather than keep it alive.
 #[cfg(unix)]
 pub fn send_file(
     out_fd: std::os::unix::io::RawFd,
@@ -198,7 +251,12 @@ pub fn send_file(
             return Err(e);
         }
         if sent == 0 {
-            break; // file ended before its declared length
+            // File ended before its declared length: we've under-delivered the
+            // body. Fail so the connection is closed (it can't be reused safely).
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file truncated during send",
+            ));
         }
         remaining -= sent as u64;
     }
