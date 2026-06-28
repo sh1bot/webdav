@@ -13,11 +13,12 @@
 //! Basic credentials are configured, this program enforces no auth of its own
 //! and relies entirely on stunnel / the network for access control.
 //!
-//! Confinement is also stunnel's job: its `chroot` / `setuid` / `setgid` options
-//! jail the process and drop privileges before it execs us, so we run already
-//! unprivileged. We read the request from stdin, write the reply to stdout, log
-//! to stderr, and otherwise touch only the served tree — so the chroot jail
-//! needs nothing in it but this (static) binary and the files being served.
+//! Confinement: if stunnel execs us as root, we chroot into the served directory
+//! and drop to `nobody` ourselves (after reading any command-line files, so they
+//! can live outside the chroot). Because the static binary is already in memory
+//! and `/etc/passwd` is read before the chroot, the served directory needs
+//! nothing added to it. If stunnel already dropped privileges (its own `setuid`),
+//! we run unprivileged and this step is a no-op.
 
 mod auth;
 mod dav;
@@ -207,8 +208,90 @@ fn main() {
         );
     }
 
-    // Confinement (chroot) and dropping to an unprivileged user are stunnel's
-    // job (`chroot` / `setuid` / `setgid` in its config), done before it execs
-    // us — so by the time we run we're already jailed and unprivileged.
-    serve_stdin(&canonical_root, &auth);
+    // Everything taken from the command line is now open: --log-file is dup'd
+    // onto fd 2 and --auth-file has been read into memory, both before the chroot
+    // below (the served files themselves live inside the chroot and are opened
+    // after it). Now confine: if we're root, chroot into the served directory and
+    // drop to `nobody`. The returned path is what we serve from afterwards — "/"
+    // once chrooted. If we aren't root (e.g. stunnel already dropped us), this is
+    // a no-op and we serve the canonical root as-is.
+    let serve_root = lower_privileges(&canonical_root);
+
+    serve_stdin(&serve_root, &auth);
+}
+
+/// Print a fatal error to stderr and exit non-zero.
+fn fatal(msg: &str) -> ! {
+    eprintln!("fatal: {}", msg);
+    process::exit(1);
+}
+
+/// When started as root, confine the process to `root`: look up the `nobody`
+/// account, `chroot` into `root`, `chdir` to the new `/`, then drop supplementary
+/// groups, gid and uid (in that order). The `nobody` ids are resolved *before*
+/// the chroot, while `/etc/passwd` is still reachable. Returns the path to serve
+/// from afterwards: `/` once chrooted, or `root` unchanged when we weren't root
+/// (e.g. stunnel already dropped privileges). A failure while root is fatal — we
+/// must never continue with elevated privileges.
+#[cfg(unix)]
+fn lower_privileges(root: &Path) -> PathBuf {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Not root: nothing to confine/drop (the supervisor may already have).
+    if unsafe { libc::geteuid() } != 0 {
+        return root.to_path_buf();
+    }
+
+    // Resolve `nobody` before chrooting, while /etc/passwd is reachable.
+    let (uid, gid) = unsafe {
+        let pw = libc::getpwnam(c"nobody".as_ptr());
+        if pw.is_null() {
+            (65534, 65534) // conventional nobody / nogroup ids
+        } else {
+            ((*pw).pw_uid, (*pw).pw_gid)
+        }
+    };
+
+    let c_root = CString::new(root.as_os_str().as_bytes())
+        .unwrap_or_else(|_| fatal("root path contains an interior NUL byte"));
+
+    unsafe {
+        if libc::chroot(c_root.as_ptr()) != 0 {
+            fatal(&format!(
+                "chroot to {} failed: {}",
+                root.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        if libc::chdir(c"/".as_ptr()) != 0 {
+            fatal(&format!("chdir(/) failed: {}", io::Error::last_os_error()));
+        }
+        // Drop supplementary groups, then gid, then uid — order matters, and any
+        // failure is fatal so we never keep a shred of root.
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            fatal(&format!("setgroups failed: {}", io::Error::last_os_error()));
+        }
+        if libc::setgid(gid) != 0 {
+            fatal(&format!(
+                "setgid({}) failed: {}",
+                gid,
+                io::Error::last_os_error()
+            ));
+        }
+        if libc::setuid(uid) != 0 {
+            fatal(&format!(
+                "setuid({}) failed: {}",
+                uid,
+                io::Error::last_os_error()
+            ));
+        }
+    }
+
+    PathBuf::from("/")
+}
+
+#[cfg(not(unix))]
+fn lower_privileges(root: &Path) -> PathBuf {
+    root.to_path_buf()
 }

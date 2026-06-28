@@ -8,27 +8,18 @@
 ;
 ;   stunnel /etc/stunnel/tiny-webdav.conf
 ;
-; Run stunnel as root so it can chroot and drop privileges (below) before
-; exec'ing tiny-webdav. tiny-webdav does no confinement of its own.
+; Run stunnel AS ROOT and do NOT set stunnel's own chroot/setuid here: tiny-webdav
+; confines itself when started as root (it chroots into --root and drops to
+; nobody). That keeps the served directory free of any jail scaffolding.
 
 ; stunnel's own diagnostics (tiny-webdav logs separately via --log-file below).
 foreground = no
 output = /var/log/stunnel-tiny-webdav.log
 
-; --- Confinement: jail + drop privileges before exec'ing tiny-webdav ---
-; cert/key/CAfile above are read BEFORE the chroot, so they live outside it.
-; Because tiny-webdav is a static binary that uses only stdin/stdout/stderr and
-; the served files, the jail needs only the binary and the served tree:
-;   /srv/jail/tiny-webdav            (the static binary; exec target below)
-;   /srv/jail/files/...              (the served tree; --root /files below)
-chroot = /srv/jail
-setuid = nobody
-setgid = nogroup
-
 [tiny-webdav]
 accept = 8443
 
-; --- Server identity presented to clients (read before chroot) ---
+; --- Server identity presented to clients ---
 cert = /etc/tiny-webdav/server.crt
 key  = /etc/tiny-webdav/server.key
 
@@ -40,9 +31,10 @@ CAfile = /etc/tiny-webdav/ca.crt
 verify = 2
 
 ; --- Run tiny-webdav per connection, speaking plaintext on stdin/stdout ---
-; Paths below are resolved INSIDE the chroot. An --auth-file would have to live
-; in the jail too, readable by the setuid user.
+; Started as root, tiny-webdav chroots into --root and drops to nobody itself.
+; The binary, --auth-file and --log-file are all outside --root and are loaded
+; before the chroot; the served files must be readable by nobody.
 ; tiny-webdav logs to stderr, which stunnel passes through to its own stderr —
 ; the systemd journal (journalctl -u stunnel) when stunnel runs as a service.
-exec     = /tiny-webdav
-execargs = tiny-webdav --root /files
+exec     = /usr/local/bin/tiny-webdav
+execargs = tiny-webdav --root /srv/files --auth-file /etc/tiny-webdav/users.txt

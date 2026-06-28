@@ -53,8 +53,8 @@ because `SSL_CLIENT_DN` is present.
 - Optional HTTP Basic username/password auth (`401` challenge with
   `WWW-Authenticate` when missing/invalid).
 - Rejects path traversal (`..`) and symlink escapes, so only files under
-  `--root` are reachable. Confinement (`chroot`) and dropping privileges are
-  delegated to stunnel, so the binary itself contains no privileged code.
+  `--root` are reachable. When started as root it `chroot`s into `--root` and
+  drops to `nobody`; nothing needs to be added to the served directory to do so.
 - Tiny dependency footprint: just `libc`. No TLS stack, no async runtime, no
   HTTP framework.
 
@@ -118,8 +118,8 @@ process per connection with the plaintext stream on fd 0.
 
 - To disable client-cert auth, drop the `CAfile`/`verify` lines and rely on
   tiny-webdav's HTTP Basic auth (and/or the network).
-- **Confinement** (`chroot` + dropping privileges) is stunnel's job too — see
-  the next section.
+- **Confinement** (`chroot` + dropping to `nobody`) is done by tiny-webdav itself
+  when stunnel execs it as root — see the next section.
 - **Logging:** by default tiny-webdav writes diagnostics to stderr, which stunnel
   passes through to *its* stderr — i.e. the systemd journal (`journalctl -u
   stunnel`) when stunnel runs as a service. No `--log-file` needed here. (Under
@@ -128,39 +128,29 @@ process per connection with the plaintext stream on fd 0.
 
 ### Confinement (chroot + drop privileges)
 
-tiny-webdav does **not** chroot or change uid itself. Instead, stunnel's `chroot`
-/ `setuid` / `setgid` options jail the process and drop privileges *before* it
-execs tiny-webdav, so the server runs already-confined and unprivileged. Because
-the binary is **static** and reads/writes only the standard descriptors and the
-served files, the jail needs nothing but the binary and the served tree:
-
-```
-/srv/jail/
-├── tiny-webdav            # the static binary (exec target, inside the jail)
-└── files/                 # the served tree (--root /files)
-    └── ...
-```
-
-Add to the stunnel config (global section), and run stunnel as root so it can
-chroot and drop:
+When tiny-webdav is started **as root**, it confines itself: it looks up the
+`nobody` account, `chroot`s into `--root`, `chdir`s to the new `/`, and drops
+supplementary groups, gid and uid. To make that work you just run stunnel as
+root (don't set stunnel's `setuid`/`chroot`), so it execs tiny-webdav with root
+privileges:
 
 ```ini
-chroot = /srv/jail
-setuid = nobody
-setgid = nogroup
-; cert/key/CAfile are read before the chroot, so they can live outside the jail:
-cert   = /etc/tiny-webdav/server.crt
-key    = /etc/tiny-webdav/server.key
-exec     = /tiny-webdav                 ; path *inside* the jail
-execargs = tiny-webdav --root /files
+; in the [tiny-webdav] section — note: NO stunnel chroot/setuid here
+exec     = /usr/local/bin/tiny-webdav
+execargs = tiny-webdav --root /srv/files --auth-file /etc/tiny-webdav/users.txt
 ```
 
-Notes:
+Nothing needs to be assembled in the served directory. Everything outside it is
+opened *before* the chroot — the binary is already in memory (and static), the
+`nobody` lookup reads `/etc/passwd`, `--auth-file` is read into memory, and
+`--log-file` is opened and kept on fd 2. After the chroot only the served files
+(under `--root`, now `/`) are touched. A failed drop while root is fatal — the
+server will not run with elevated privileges.
 
-- The exec path and `--root` are resolved **inside** the jail.
-- `--auth-file` / `--log-file`, if used, must also live inside the jail and be
-  readable (the log, writable) by the `setuid` user — they're opened after the
-  drop.
+If you'd rather have **stunnel** do the confinement instead (its `chroot` /
+`setuid` / `setgid`), that also works: tiny-webdav then runs already-unprivileged
+and skips its own step — but you'd have to place the static binary inside
+stunnel's jail.
 
 ### Letting xinetd own the socket (optional)
 
@@ -186,7 +176,7 @@ service tiny-webdav {
     socket_type = stream
     protocol    = tcp
     wait        = no                 # one process per connection
-    user        = root               # so stunnel can chroot + drop privileges
+    user        = root               # so tiny-webdav can chroot + drop to nobody
     instances   = 50                 # cap concurrent connections
     per_source  = 5                  # ...and per client IP
     server      = /usr/bin/stunnel
@@ -278,12 +268,11 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
   *outside* the served root is refused (`403`) and omitted from listings, so it
   can't be used to escape the root. (After a successful `chroot` this is moot —
   nothing outside the root exists.)
-- **Confinement and privilege drop are stunnel's responsibility** (`chroot` /
-  `setuid` / `setgid`), applied before it execs tiny-webdav — see *Confinement*
-  above. tiny-webdav contains no `chroot`/`setuid` code and reads no system files
-  of its own (no `/etc/passwd`, not even `/dev/null`): being a static binary that
-  uses only stdin/stdout/stderr and the served files, it runs in a jail
-  containing nothing but itself and the served tree. The served files (and any
-  `--auth-file`) must be readable by the user stunnel drops to.
+- **Started as root, tiny-webdav confines itself** — see *Confinement* above: it
+  `chroot`s into `--root` and drops to `nobody`, with `/etc/passwd` and any
+  command-line files (`--auth-file`, `--log-file`) opened before the chroot so
+  they can live outside the served tree. A failed drop is fatal. The served files
+  (and any `--auth-file`) must be readable by `nobody`. If stunnel drops
+  privileges itself instead, tiny-webdav runs unprivileged and skips this.
 - The example certificates from `gen-certs.sh` are for testing only. Use your
   own PKI in production and keep private keys readable only by their owner.
