@@ -95,14 +95,11 @@ impl Auth {
             Some(p) => p,
             None => return false,
         };
-        match self.creds.get(user) {
-            Some(expected) => constant_time_eq(expected.as_bytes(), pass.as_bytes()),
-            // Still do a comparison against a dummy to keep timing uniform-ish.
-            None => {
-                let _ = constant_time_eq(b"x", pass.as_bytes());
-                false
-            }
-        }
+        // `password_matches` does the same length-governed work whether or not
+        // the account exists, so a wrong password, a length mismatch, and an
+        // unknown user are not distinguishable by timing.
+        let stored = self.creds.get(user).map(String::as_bytes);
+        password_matches(stored, pass.as_bytes())
     }
 
     /// Send a `401 Unauthorized` challenge prompting for Basic credentials.
@@ -122,17 +119,56 @@ impl Auth {
     }
 }
 
-/// Length-independent-ish equality: compares all bytes when lengths match so a
-/// match doesn't return faster than a near-match. (Length itself is not hidden.)
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Check `candidate` against the stored password (`None` for an unknown account)
+/// without leaking, by timing, whether the account exists or how long its
+/// password is. There is deliberately **no** early return on a length mismatch:
+/// the work is governed solely by `candidate.len()` (which the caller already
+/// controls), so an unknown user, a wrong-length password, and a wrong password
+/// all take the same time. The length difference is folded into the accumulator
+/// so unequal lengths can never compare equal, and a trailing existence check
+/// rejects a candidate that happens to match an empty/absent reference.
+///
+/// (Each connection is its own fork+exec+chroot+setuid process, whose spawn cost
+/// dwarfs any byte-compare timing, so this closes the obvious algorithmic signal
+/// rather than promising perfect constant-time at the instruction level.)
+fn password_matches(stored: Option<&[u8]>, candidate: &[u8]) -> bool {
+    let reference = stored.unwrap_or(&[]);
+    let mut diff = (reference.len() ^ candidate.len()) as u32;
+    for (i, &c) in candidate.iter().enumerate() {
+        let r = reference.get(i).copied().unwrap_or(0); // 0-pad past the reference
+        diff |= u32::from(r ^ c);
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    diff == 0 && stored.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::password_matches as pm;
+
+    #[test]
+    fn correct_password_matches() {
+        assert!(pm(Some(b"s3cret"), b"s3cret"));
     }
-    diff == 0
+
+    #[test]
+    fn wrong_password_rejected() {
+        assert!(!pm(Some(b"s3cret"), b"s3crXt")); // same length, wrong byte
+        assert!(!pm(Some(b"s3cret"), b"s3cre")); // shorter
+        assert!(!pm(Some(b"s3cret"), b"s3cretX")); // longer
+    }
+
+    #[test]
+    fn unknown_account_rejected_for_any_candidate() {
+        assert!(!pm(None, b""));
+        assert!(!pm(None, b"anything"));
+        assert!(!pm(None, b"\0")); // can't sneak past via the 0-padding
+    }
+
+    #[test]
+    fn empty_stored_password_only_matches_empty() {
+        assert!(pm(Some(b""), b""));
+        assert!(!pm(Some(b""), b"x"));
+    }
 }
 
 /// Minimal standard-alphabet base64 decoder. Tolerates missing `=` padding and
