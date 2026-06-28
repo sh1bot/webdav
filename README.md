@@ -161,8 +161,6 @@ Notes:
 - `--auth-file` / `--log-file`, if used, must also live inside the jail and be
   readable (the log, writable) by the `setuid` user — they're opened after the
   drop.
-- stunnel/OpenSSL may want `dev/urandom` in the jail on some versions; OpenSSL 3
-  uses the `getrandom(2)` syscall and typically needs nothing.
 
 ### Letting xinetd own the socket (optional)
 
