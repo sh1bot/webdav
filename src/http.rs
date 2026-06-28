@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::time::SystemTime;
 
 use crate::util;
@@ -65,28 +65,27 @@ impl Request {
 /// Read and parse a single request line + headers, then drain any body
 /// announced via `Content-Length` (we don't need the body content, but we
 /// must consume it to keep the stream sane before replying).
-pub fn read_request<S: Read>(stream: &mut S) -> io::Result<Request> {
+pub fn read_request<S: BufRead>(stream: &mut S) -> io::Result<Request> {
+    // Read the header block a line at a time until the blank line that ends it.
+    // `read_until` pulls a whole line straight from the buffer, rather than one
+    // trait call per byte.
     let mut buf = Vec::with_capacity(1024);
-    let mut byte = [0u8; 1];
-
-    // Read until the CRLFCRLF that terminates the header block.
     loop {
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
+        let start = buf.len();
+        if stream.read_until(b'\n', &mut buf)? == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "connection closed before request was complete",
             ));
-        }
-        buf.push(byte[0]);
-        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-            break;
         }
         if buf.len() > MAX_HEADER_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "request headers too large",
             ));
+        }
+        if &buf[start..] == b"\r\n" {
+            break; // a CRLF on its own line terminates the header block
         }
     }
 
