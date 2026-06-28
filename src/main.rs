@@ -25,7 +25,7 @@ mod http;
 mod util;
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -115,26 +115,10 @@ fn build_auth(args: &Args) -> io::Result<Auth> {
     Ok(auth)
 }
 
-/// Serve one request: read it from `input` (stdin) and write the reply to
-/// `output` (stdout). We make no assumption about what kind of descriptors
-/// these are — only that we can read the request from one and write the reply
-/// to the other, which is the inetd contract stunnel/xinetd satisfy.
-fn serve<R: Read, W: Write + AsRawFd>(
-    input: &mut R,
-    output: &mut W,
-    root: &Path,
-    auth: &Auth,
-) -> io::Result<()> {
-    let req = http::read_request(input)?;
-    dav::handle(output, root, auth, &req)?;
-    output.flush()
-}
-
-/// stunnel/inetd hands us the connection on the standard descriptors. Per the
-/// inetd contract we read the request from stdin (fd 0), write the reply to
-/// stdout (fd 1), and log to stderr (fd 2) — without assuming any of them is a
-/// socket. (Under stunnel/xinetd they all refer to one connection, but nothing
-/// here relies on that.)
+/// Serve the one request stunnel/inetd handed us. Per the inetd contract we read
+/// the request from stdin (fd 0), write the reply to stdout (fd 1), and log to
+/// stderr (fd 2) — without assuming any of them is a socket. (Under stunnel/xinetd
+/// they all refer to one connection, but nothing here relies on that.)
 #[cfg(unix)]
 fn serve_stdin(root: &Path, auth: &Auth) {
     use std::os::unix::io::FromRawFd;
@@ -144,7 +128,10 @@ fn serve_stdin(root: &Path, auth: &Auth) {
     let mut input = unsafe { File::from_raw_fd(0) };
     let mut output = unsafe { File::from_raw_fd(1) };
 
-    if let Err(e) = serve(&mut input, &mut output, root, auth) {
+    let result = http::read_request(&mut input)
+        .and_then(|req| dav::handle(&mut output, root, auth, &req))
+        .and_then(|()| output.flush());
+    if let Err(e) = result {
         eprintln!("connection error: {}", e);
     }
 }
