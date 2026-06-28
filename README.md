@@ -129,10 +129,11 @@ process per connection with the plaintext stream on fd 0.
 ### Confinement (chroot + drop privileges)
 
 When tiny-webdav is started **as root**, it confines itself: it looks up the
-`nobody` account, `chroot`s into `--root`, `chdir`s to the new `/`, and drops
-supplementary groups, gid and uid. To make that work you just run stunnel as
-root (don't set stunnel's `setuid`/`chroot`), so it execs tiny-webdav with root
-privileges:
+target account (`--run-as`, default `nobody`), `chroot`s into `--root`, `chdir`s
+to the new `/`, and drops supplementary groups, gid and uid to that account (its
+primary group is used for the gid; a `--run-as` user that doesn't exist is a
+fatal error). To make that work you just run stunnel as root (don't set
+stunnel's `setuid`/`chroot`), so it execs tiny-webdav with root privileges:
 
 ```ini
 ; in the [tiny-webdav] section — note: NO stunnel chroot/setuid here
@@ -198,6 +199,7 @@ does this.
 | Flag           | Meaning                                                            | Default            |
 |----------------|-------------------------------------------------------------------|--------------------|
 | `--root`       | Directory to serve (read-only)                                    | current directory  |
+| `--run-as`     | When started as root, user to `chroot`+drop to (must exist)       | `nobody`           |
 | `--log-file`   | Write diagnostics to this file instead of stderr. Needed under xinetd, where stderr is the client socket | *(none → stderr)* |
 | `--auth-file`  | File of `username:password` lines (`#` comments allowed)          | *(none)*           |
 | `--user`       | A single username (use together with `--password`)                | *(none)*           |
@@ -274,11 +276,12 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
   can't be used to escape the root. (After a successful `chroot` this is moot —
   nothing outside the root exists.)
 - **Started as root, tiny-webdav confines itself** — see *Confinement* above: it
-  `chroot`s into `--root` and drops to `nobody`, with `/etc/passwd` and any
-  command-line files (`--auth-file`, `--log-file`) opened before the chroot so
-  they can live outside the served tree. A failed drop is fatal. The served files
-  (and any `--auth-file`) must be readable by `nobody`. If stunnel drops
-  privileges itself instead, tiny-webdav runs unprivileged and skips this.
+  `chroot`s into `--root` and drops to the `--run-as` user (default `nobody`),
+  with `/etc/passwd` and any command-line files (`--auth-file`, `--log-file`)
+  opened before the chroot so they can live outside the served tree. A failed
+  drop is fatal. The served files (and any `--auth-file`) must be readable by that
+  user. If stunnel drops privileges itself instead, tiny-webdav runs unprivileged
+  and skips this.
 - **Defense-in-depth:** regardless of who drops privileges, tiny-webdav sets
   `PR_SET_NO_NEW_PRIVS` and zeroes `RLIMIT_CORE` and `RLIMIT_NPROC` — so it can't
   gain privileges via a later `exec`, can't dump core (which might leak file
