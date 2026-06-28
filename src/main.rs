@@ -39,7 +39,6 @@ struct Args {
     password: Option<String>,
     realm: String,
     log_file: Option<PathBuf>,
-    timeout: u64,
 }
 
 fn usage() -> ! {
@@ -53,8 +52,6 @@ fn usage() -> ! {
            tiny-webdav [--root <dir>] [options]\n\n\
          OPTIONS:\n  \
            --root <dir>            Directory to serve (default: current directory)\n  \
-           --timeout <secs>        Per-read/write socket timeout (default: 30, 0 to\n                          \
-                       disable; raise/disable for large transfers to slow links)\n  \
            --log-file <file>       Write diagnostics to this file. Default: stderr\n                          \
                        (captured by stunnel/systemd). Use this under xinetd,\n                          \
                        where stderr is the client socket.\n\n  \
@@ -74,7 +71,6 @@ fn parse_args() -> Args {
     let mut password: Option<String> = None;
     let mut realm = "tiny-webdav".to_string();
     let mut log_file: Option<PathBuf> = None;
-    let mut timeout: u64 = 30;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -85,12 +81,6 @@ fn parse_args() -> Args {
             "--password" => password = Some(it.next().unwrap_or_else(|| usage())),
             "--realm" => realm = it.next().unwrap_or_else(|| usage()),
             "--log-file" => log_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
-            "--timeout" => {
-                timeout = it
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| usage())
-            }
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("error: unexpected argument '{}'\n", other);
@@ -111,7 +101,6 @@ fn parse_args() -> Args {
         password,
         realm,
         log_file,
-        timeout,
     }
 }
 
@@ -147,7 +136,7 @@ fn serve<R: Read, W: Write + AsRawFd>(
 /// socket. (Under stunnel/xinetd they all refer to one connection, but nothing
 /// here relies on that.)
 #[cfg(unix)]
-fn serve_stdin(root: &Path, auth: &Auth, timeout: u64) {
+fn serve_stdin(root: &Path, auth: &Auth) {
     use std::os::unix::io::FromRawFd;
 
     // Safety: fd 0/1 are the inherited, owned connection descriptors. The File
@@ -155,38 +144,15 @@ fn serve_stdin(root: &Path, auth: &Auth, timeout: u64) {
     let mut input = unsafe { File::from_raw_fd(0) };
     let mut output = unsafe { File::from_raw_fd(1) };
 
-    // Best effort: *if* these are sockets, bound how long any single read/write
-    // may block (slowloris protection). Silently ignored on non-sockets, so this
-    // is opportunistic hardening, not an assumption that they are sockets.
-    if timeout != 0 {
-        set_socket_timeouts(timeout);
-    }
-
     if let Err(e) = serve(&mut input, &mut output, root, auth) {
         eprintln!("connection error: {}", e);
     }
 }
 
 #[cfg(not(unix))]
-fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64) {
+fn serve_stdin(_root: &Path, _auth: &Auth) {
     eprintln!("error: tiny-webdav is only supported on Unix platforms");
     process::exit(1);
-}
-
-/// Best-effort `SO_RCVTIMEO` / `SO_SNDTIMEO` on the read (fd 0) and write (fd 1)
-/// descriptors. Any error (e.g. the fd isn't a socket) is ignored.
-#[cfg(unix)]
-fn set_socket_timeouts(secs: u64) {
-    let tv = libc::timeval {
-        tv_sec: secs as _, // infer tv_sec's width (time_t differs across libcs)
-        tv_usec: 0,
-    };
-    let p = (&tv as *const libc::timeval).cast();
-    let len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
-    unsafe {
-        libc::setsockopt(0, libc::SOL_SOCKET, libc::SO_RCVTIMEO, p, len);
-        libc::setsockopt(1, libc::SOL_SOCKET, libc::SO_SNDTIMEO, p, len);
-    }
 }
 
 #[cfg(not(unix))]
@@ -257,5 +223,5 @@ fn main() {
     // Confinement (chroot) and dropping to an unprivileged user are stunnel's
     // job (`chroot` / `setuid` / `setgid` in its config), done before it execs
     // us — so by the time we run we're already jailed and unprivileged.
-    serve_stdin(&canonical_root, &auth, args.timeout);
+    serve_stdin(&canonical_root, &auth);
 }

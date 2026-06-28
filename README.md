@@ -203,7 +203,6 @@ does this.
 | Flag           | Meaning                                                            | Default            |
 |----------------|-------------------------------------------------------------------|--------------------|
 | `--root`       | Directory to serve (read-only)                                    | current directory  |
-| `--timeout`    | Per-read/write socket timeout in seconds (`0` disables — raise or disable for large transfers over slow links) | `30` |
 | `--log-file`   | Write diagnostics to this file instead of stderr. Needed under xinetd, where stderr is the client socket | *(none → stderr)* |
 | `--auth-file`  | File of `username:password` lines (`#` comments allowed)          | *(none)*           |
 | `--user`       | A single username (use together with `--password`)                | *(none)*           |
@@ -268,13 +267,10 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
 - **TLS, ciphers, and client-certificate verification are stunnel's
   responsibility.** Keep stunnel configured and patched; tiny-webdav contains no
   TLS code at all.
-- Concurrency is whatever stunnel provides (one process per connection). Bound it
-  in stunnel (e.g. there is no built-in cap, so use firewalling / `per_source`
-  via xinetd, or a connection-limited front end) for any exposed deployment.
-- The per-operation read/write timeout (`--timeout`, default 30s) bounds how long
-  a slow client can stall a connection. Because it is per-operation rather than
-  idle-based, a genuinely slow link pulling a very large file can trip it — raise
-  `--timeout` or set it to `0` for those cases.
+- Concurrency, connection limits, and slow/idle-client timeouts are all stunnel's
+  job (one process per connection; `TIMEOUTidle`/`TIMEOUTbusy`, plus `per_source`
+  via xinetd or a connection-limited front end). tiny-webdav has no timeouts of
+  its own — a hung connection only ties up its own process, which stunnel reaps.
 - **"Read-only" means no client request can modify the served tree** (there is
   no PUT/DELETE/etc.). The process itself only writes the operator-specified
   `--log-file`.
