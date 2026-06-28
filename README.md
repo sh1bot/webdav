@@ -287,5 +287,14 @@ openssl pkcs12 -export -inkey certs/client.key -in certs/client.crt \
   gain privileges via a later `exec`, can't dump core (which might leak file
   data), and can't fork. seccomp syscall filtering is deliberately *not* used, to
   avoid a brittle allowlist; the above plus the chroot/uid drop are the confines.
+- **Client-cert auth is stunnel's job; the `SSL_CLIENT_DN` warning trusts it.**
+  tiny-webdav never verifies client certificates itself — it reads `SSL_CLIENT_DN`
+  (set by stunnel only for a cert that verified against `CAfile`) purely to decide
+  whether to log the "unauthenticated request" warning. It is never used for an
+  access decision, so a spoofed value could at worst suppress a log line, not
+  bypass anything. With `verify = 2` (or `1`) stunnel rejects an untrusted cert at
+  the handshake, so the variable is only ever set for a genuinely trusted
+  identity; the warning's accuracy therefore depends on stunnel being set to
+  verify (as the example configs are).
 - The example certificates from `gen-certs.sh` are for testing only. Use your
   own PKI in production and keep private keys readable only by their owner.
