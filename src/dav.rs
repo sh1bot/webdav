@@ -78,9 +78,11 @@ fn get_or_head<S: Write + AsRawFd>(
         Ok(m) => m,
         Err(e) => return err_status(stream, &e),
     };
-    // Reject anything (e.g. a symlink target) that resolves outside the root.
+    // A symlink target outside the root is treated as Not Found, exactly as it
+    // would be once chrooted (where it simply doesn't exist) — so the response
+    // never reveals whether the server is chrooted.
     if !within_root(root, fs_path) {
-        return http::write_status(stream, 403, "Forbidden");
+        return http::write_status(stream, 404, "Not Found");
     }
 
     if meta.is_dir() {
@@ -461,8 +463,10 @@ fn propfind<S: Write>(
         Ok(m) => m,
         Err(e) => return err_status(stream, &e),
     };
+    // Treat an out-of-root target as Not Found (see get_or_head): the response
+    // must not reveal whether the server is chrooted.
     if !within_root(root, fs_path) {
-        return http::write_status(stream, 403, "Forbidden");
+        return http::write_status(stream, 404, "Not Found");
     }
 
     // Depth: 0 => just this resource; 1 => this resource + immediate children.
