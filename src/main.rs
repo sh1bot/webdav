@@ -12,6 +12,11 @@
 //! **HTTP Basic username/password** is enforced here, layered on top. If no
 //! Basic credentials are configured, this program enforces no auth of its own
 //! and relies entirely on stunnel / the network for access control.
+//!
+//! Confinement is also stunnel's job: its `chroot` / `setuid` / `setgid` options
+//! jail the process and drop privileges before it execs us, so we run already
+//! unprivileged and need read no files of our own beyond /dev/null and the
+//! served tree.
 
 mod auth;
 mod dav;
@@ -245,95 +250,8 @@ fn main() {
         );
     }
 
-    // Everything that needs the original filesystem is done (credentials are in
-    // memory). Confine the process: chroot into the served directory and drop to
-    // an unprivileged user. If we lack the privileges (i.e. we were started as a
-    // non-root user already), this is skipped. The returned path is the root to
-    // serve from afterwards (`/` once chrooted).
-    let serve_root = lower_privileges(&canonical_root);
-
-    serve_stdin(&serve_root, &auth, args.timeout);
-}
-
-/// Confine the process after startup: `chroot` into `root`, then drop to the
-/// unprivileged `nobody` account. Returns the path to serve from afterwards —
-/// `/` when the chroot succeeds (the served directory becomes the new root),
-/// otherwise `root` unchanged. When not started as root this is skipped;
-/// when started as root, a failed privilege drop is fatal.
-#[cfg(unix)]
-fn lower_privileges(root: &Path) -> PathBuf {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    // If we're not effectively root we can't chroot or change uid; say so once
-    // and carry on with current privileges. (stunnel/xinetd typically start the
-    // service as an unprivileged user already, in which case this is expected.)
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("not running as root: skipping chroot and privilege drop");
-        return root.to_path_buf();
-    }
-
-    // Resolve the `nobody` account *before* chrooting, while /etc is reachable.
-    let (uid, gid) = unsafe {
-        let pw = libc::getpwnam(c"nobody".as_ptr());
-        if pw.is_null() {
-            (65534, 65534) // conventional nobody / nogroup ids
-        } else {
-            ((*pw).pw_uid, (*pw).pw_gid)
-        }
-    };
-
-    let mut serve_root = root.to_path_buf();
-
-    // chroot into the served directory, then make it the working directory.
-    // chroot itself is best-effort (we still drop privileges below if it fails).
-    match CString::new(root.as_os_str().as_bytes()) {
-        Ok(c_root) => unsafe {
-            if libc::chroot(c_root.as_ptr()) == 0 && libc::chdir(c"/".as_ptr()) == 0 {
-                serve_root = PathBuf::from("/");
-                eprintln!("chroot: confined to {}", root.display());
-            } else {
-                eprintln!(
-                    "chroot to {} failed ({}); carrying on without chroot",
-                    root.display(),
-                    io::Error::last_os_error()
-                );
-            }
-        },
-        Err(_) => eprintln!("chroot skipped: root path contains an interior NUL byte"),
-    }
-
-    // Drop supplementary groups, then gid, then uid (must be in this order).
-    // We are root here, so failing to drop is a hard security failure (we'd keep
-    // serving with root privileges) — treat it as fatal rather than carrying on.
-    unsafe {
-        if libc::setgroups(0, std::ptr::null()) != 0 {
-            eprintln!("setgroups failed ({})", io::Error::last_os_error());
-        }
-        if libc::setgid(gid) != 0 {
-            eprintln!(
-                "fatal: setgid({}) failed ({})",
-                gid,
-                io::Error::last_os_error()
-            );
-            process::exit(1);
-        }
-        if libc::setuid(uid) != 0 {
-            eprintln!(
-                "fatal: setuid({}) failed ({})",
-                uid,
-                io::Error::last_os_error()
-            );
-            process::exit(1);
-        }
-    }
-    eprintln!("dropped privileges to nobody (uid={}, gid={})", uid, gid);
-
-    serve_root
-}
-
-#[cfg(not(unix))]
-fn lower_privileges(root: &Path) -> PathBuf {
-    eprintln!("chroot/privilege drop not supported on this platform; carrying on");
-    root.to_path_buf()
+    // Confinement (chroot) and dropping to an unprivileged user are stunnel's
+    // job (`chroot` / `setuid` / `setgid` in its config), done before it execs
+    // us — so by the time we run we're already jailed and unprivileged.
+    serve_stdin(&canonical_root, &auth, args.timeout);
 }

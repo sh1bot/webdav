@@ -12,8 +12,8 @@
 ; hands it on stdin. (If you'd rather stunnel own the socket itself, use
 ; stunnel.conf.example instead, which has an [service] section with `accept`.)
 ;
-; Pair this with the xinetd service in the README. Run xinetd's service as root
-; if you want tiny-webdav to chroot + drop to `nobody`.
+; Pair this with the xinetd service in the README, run as root so stunnel can
+; chroot and drop privileges (below) before exec'ing tiny-webdav.
 
 ; Logging MUST NOT go to stderr here: under xinetd, stderr is the client socket,
 ; so a stray log line would corrupt the TLS stream. Send it to a file instead.
@@ -21,7 +21,15 @@ syslog = no
 output = /var/log/stunnel-tiny-webdav.log
 foreground = yes
 
-; --- Server identity presented to clients ---
+; --- Confinement: jail + drop privileges before exec'ing tiny-webdav ---
+; cert/key/CAfile below are read BEFORE the chroot, so they live outside it.
+; The static binary means the jail needs only the binary, dev/null, the served
+; tree, and (since --log-file is required under xinetd, see below) a writable log.
+chroot = /srv/jail
+setuid = nobody
+setgid = nogroup
+
+; --- Server identity presented to clients (read before chroot) ---
 cert = /etc/tiny-webdav/server.crt
 key  = /etc/tiny-webdav/server.key
 
@@ -31,7 +39,8 @@ CAfile = /etc/tiny-webdav/ca.crt
 verify = 2
 
 ; --- Run tiny-webdav per connection, speaking plaintext on stdin/stdout ---
-; --log-file is REQUIRED under xinetd: tiny-webdav's stderr is the client socket
-; here, so it must send diagnostics to a file rather than the default stderr.
-exec     = /usr/local/bin/tiny-webdav
-execargs = tiny-webdav --root /srv/files --auth-file /etc/tiny-webdav/users.txt --log-file /var/log/tiny-webdav.log
+; Paths below are resolved INSIDE the chroot. --log-file is REQUIRED under
+; xinetd (tiny-webdav's stderr is the client socket here), and it must point
+; inside the jail, writable by the setuid user.
+exec     = /tiny-webdav
+execargs = tiny-webdav --root /files --log-file /tiny-webdav.log

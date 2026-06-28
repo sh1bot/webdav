@@ -8,18 +8,28 @@
 ;
 ;   stunnel /etc/stunnel/tiny-webdav.conf
 ;
-; Run stunnel as root if you want tiny-webdav to chroot + drop to `nobody` per
-; connection (it inherits stunnel's privileges). If stunnel runs unprivileged,
-; tiny-webdav simply skips that step.
+; Run stunnel as root so it can chroot and drop privileges (below) before
+; exec'ing tiny-webdav. tiny-webdav does no confinement of its own.
 
 ; stunnel's own diagnostics (tiny-webdav logs separately via --log-file below).
 foreground = no
 output = /var/log/stunnel-tiny-webdav.log
 
+; --- Confinement: jail + drop privileges before exec'ing tiny-webdav ---
+; cert/key/CAfile above are read BEFORE the chroot, so they live outside it.
+; Because tiny-webdav is a static binary, the jail needs only the binary,
+; dev/null, and the served tree:
+;   /srv/jail/tiny-webdav            (the static binary; exec target below)
+;   /srv/jail/dev/null               (mknod c 1 3; tiny-webdav points stdout here)
+;   /srv/jail/files/...              (the served tree; --root /files below)
+chroot = /srv/jail
+setuid = nobody
+setgid = nogroup
+
 [tiny-webdav]
 accept = 8443
 
-; --- Server identity presented to clients ---
+; --- Server identity presented to clients (read before chroot) ---
 cert = /etc/tiny-webdav/server.crt
 key  = /etc/tiny-webdav/server.key
 
@@ -31,8 +41,9 @@ CAfile = /etc/tiny-webdav/ca.crt
 verify = 2
 
 ; --- Run tiny-webdav per connection, speaking plaintext on stdin/stdout ---
+; Paths below are resolved INSIDE the chroot. An --auth-file would have to live
+; in the jail too, readable by the setuid user.
 ; tiny-webdav logs to stderr, which stunnel passes through to its own stderr —
 ; the systemd journal (journalctl -u stunnel) when stunnel runs as a service.
-; Add `--log-file /var/log/tiny-webdav.log` to execargs to send it to a file.
-exec     = /usr/local/bin/tiny-webdav
-execargs = tiny-webdav --root /srv/files --auth-file /etc/tiny-webdav/users.txt
+exec     = /tiny-webdav
+execargs = tiny-webdav --root /files
