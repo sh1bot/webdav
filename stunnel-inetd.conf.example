@@ -31,5 +31,7 @@ CAfile = /etc/tiny-webdav/ca.crt
 verify = 2
 
 ; --- Run tiny-webdav per connection, speaking plaintext on stdin/stdout ---
+; --log-file is REQUIRED under xinetd: tiny-webdav's stderr is the client socket
+; here, so it must send diagnostics to a file rather than the default stderr.
 exec     = /usr/local/bin/tiny-webdav
 execargs = tiny-webdav --root /srv/files --auth-file /etc/tiny-webdav/users.txt --log-file /var/log/tiny-webdav.log

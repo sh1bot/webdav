@@ -95,6 +95,11 @@ process per connection with the plaintext stream on fd 0.
 - Run stunnel **as root** if you want tiny-webdav to `chroot` + drop to `nobody`
   per connection (it inherits stunnel's privileges); otherwise that step is
   skipped.
+- **Logging:** by default tiny-webdav writes diagnostics to stderr, which stunnel
+  passes through to *its* stderr — i.e. the systemd journal (`journalctl -u
+  stunnel`) when stunnel runs as a service. No `--log-file` needed here. (Under
+  xinetd, stderr is the client socket, so there you must pass `--log-file`; see
+  below.)
 
 ### Letting xinetd own the socket (optional)
 
@@ -138,7 +143,7 @@ does this.
 |----------------|-------------------------------------------------------------------|--------------------|
 | `--root`       | Directory to serve (read-only)                                    | current directory  |
 | `--timeout`    | Per-read/write socket timeout in seconds (`0` disables — raise or disable for large transfers over slow links) | `30` |
-| `--log-file`   | Send diagnostics here (stdout/stderr are the client connection, so they are otherwise discarded) | *(none → `/dev/null`)* |
+| `--log-file`   | Write diagnostics to this file instead of stderr. Needed under xinetd, where stderr is the client socket | *(none → stderr)* |
 | `--auth-file`  | File of `username:password` lines (`#` comments allowed)          | *(none)*           |
 | `--user`       | A single username (use together with `--password`)                | *(none)*           |
 | `--password`   | Password for `--user`                                             | *(none)*           |

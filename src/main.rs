@@ -49,8 +49,9 @@ fn usage() -> ! {
            --root <dir>            Directory to serve (default: current directory)\n  \
            --timeout <secs>        Per-read/write socket timeout (default: 30, 0 to\n                          \
                        disable; raise/disable for large transfers to slow links)\n  \
-           --log-file <file>       Send diagnostics here (stdout/stderr are the\n                          \
-                       client connection, so they are otherwise discarded)\n\n  \
+           --log-file <file>       Write diagnostics to this file. Default: stderr\n                          \
+                       (captured by stunnel/systemd). Use this under xinetd,\n                          \
+                       where stderr is the client socket.\n\n  \
            HTTP Basic auth (client certs are handled by stunnel, not here):\n  \
            --auth-file <file>      File of 'username:password' lines (# comments)\n  \
            --user <name>           A single username (use with --password)\n  \
@@ -157,11 +158,16 @@ fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64) {
     process::exit(1);
 }
 
-/// inetd/stunnel duplicates the client connection onto stdout and stderr too, so
-/// point fd 1 (and fd 2) somewhere harmless before we emit anything — otherwise
-/// a stray diagnostic would corrupt the stream stunnel re-encrypts to the
-/// client. fd 1 always goes to /dev/null; fd 2 goes to `--log-file` if given,
-/// else /dev/null. fd 0 (the connection we actually serve) is left untouched.
+/// stunnel hands us the connection on fd 0 and dups it onto fd 1, so point fd 1
+/// at /dev/null before we emit anything — a stray write to stdout would
+/// otherwise corrupt the stream stunnel re-encrypts to the client. fd 0 (the
+/// connection we serve) is left untouched.
+///
+/// fd 2 carries our diagnostics. By default we leave it alone so it flows to
+/// stunnel's own stderr — the systemd journal / terminal when stunnel runs as a
+/// daemon. `--log-file` redirects it to a file instead; that is what you want
+/// under xinetd, where the inherited stderr would otherwise be the client socket
+/// and logging to it would corrupt the connection.
 #[cfg(unix)]
 fn redirect_streams(log_file: Option<&Path>) {
     use std::fs::OpenOptions;
@@ -176,15 +182,19 @@ fn redirect_streams(log_file: Option<&Path>) {
     };
     unsafe { libc::dup2(devnull.as_raw_fd(), 1) };
 
-    // stderr: a log file if requested and openable, otherwise /dev/null.
-    let log = log_file.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
-    let stderr_fd = log
-        .as_ref()
-        .map(|f| f.as_raw_fd())
-        .unwrap_or(devnull.as_raw_fd());
-    unsafe { libc::dup2(stderr_fd, 2) };
+    // Only touch fd 2 when an explicit --log-file is given: send it there, or to
+    // /dev/null if it can't be opened — never leave it pointing at the
+    // connection. With no --log-file, fd 2 keeps inheriting stunnel's stderr.
+    if let Some(path) = log_file {
+        let log = OpenOptions::new().create(true).append(true).open(path).ok();
+        let fd = log
+            .as_ref()
+            .map(|f| f.as_raw_fd())
+            .unwrap_or(devnull.as_raw_fd());
+        unsafe { libc::dup2(fd, 2) };
+    }
     // `devnull`/`log` File handles drop here, closing their original fds;
-    // the dup2'd descriptors 1 and 2 remain valid.
+    // the dup2'd descriptors remain valid.
 }
 
 #[cfg(not(unix))]
@@ -193,9 +203,10 @@ fn redirect_streams(_log_file: Option<&Path>) {}
 fn main() {
     let args = parse_args();
 
-    // stdin/stdout/stderr are the client connection. Redirect stdout and stderr
-    // away *first* so no diagnostic ever leaks onto the wire and corrupts the
-    // stream. Done before any other output.
+    // stdin/stdout/stderr come from stunnel. Move stdout off the connection (and
+    // stderr too, if --log-file was given) *first*, before any output, so no
+    // diagnostic can corrupt the stream. Without --log-file, stderr is left
+    // flowing to stunnel's stderr (the journal under systemd).
     redirect_streams(args.log_file.as_deref());
 
     let canonical_root = match args.root.canonicalize() {
@@ -222,7 +233,7 @@ fn main() {
     };
 
     // We only enforce HTTP Basic auth; client certs (if any) are stunnel's job.
-    // Warn (to the --log-file, if configured) when we enforce no auth ourselves.
+    // Warn (on stderr / the --log-file) when we enforce no auth ourselves.
     if !auth.is_enabled() {
         eprintln!(
             "WARNING: no HTTP Basic auth configured — tiny-webdav enforces no \
