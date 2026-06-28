@@ -1,0 +1,22 @@
+[package]
+name = "tiny-webdav"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny, read-only WebDAV server run under inetd/xinetd, with TLS terminated by stunnel"
+license = "MIT"
+
+[[bin]]
+name = "tiny-webdav"
+path = "src/main.rs"
+
+# No TLS dependency: TLS (and client-certificate verification) is terminated by
+# stunnel in front of us; we speak plaintext HTTP on the inherited socket.
+[dependencies]
+
+# Unix privilege dropping (chroot + setuid/setgid) and the inherited socket.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+strip = true

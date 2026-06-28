@@ -1,0 +1,21 @@
+; Example stunnel config for tiny-webdav.  Run:  stunnel /etc/stunnel/tiny-webdav.conf
+;
+; stunnel terminates TLS and execs one tiny-webdav per connection (plaintext on
+; stdin/stdout). Run it AS ROOT and do NOT set stunnel's own chroot/setuid —
+; tiny-webdav confines itself when started as root.
+
+foreground = no
+output = /var/log/stunnel-tiny-webdav.log   ; stunnel's own log
+
+[tiny-webdav]
+accept = 8443
+cert = /etc/tiny-webdav/server.crt
+key  = /etc/tiny-webdav/server.key
+
+; Client-certificate auth: require a cert signed by a CA in CAfile.
+; Delete these two lines to rely on tiny-webdav's HTTP Basic auth instead.
+CAfile = /etc/tiny-webdav/ca.crt
+verify = 2
+
+exec     = /usr/local/bin/tiny-webdav
+execargs = tiny-webdav --root /srv/files --auth-file /etc/tiny-webdav/users.txt
