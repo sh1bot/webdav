@@ -19,3 +19,4 @@ libc = "0.2"
 
 [profile.release]
 opt-level = 2
+strip = true
