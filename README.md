@@ -1,14 +1,20 @@
 # tiny-webdav
 
 A very small, **read-only** WebDAV server in Rust. It speaks **plaintext HTTP**
-and runs behind **[stunnel](https://www.stunnel.org/)**, which terminates TLS
-(and verifies client certificates) and hands each decrypted connection to a fresh
-tiny-webdav process on stdin — the classic inetd contract. All crypto stays in a
-mature, dedicated tool; the program's only dependency is `libc`.
+and, by default, runs behind **[stunnel](https://www.stunnel.org/)**, which
+terminates TLS (and verifies client certificates) and hands each decrypted
+connection to a fresh tiny-webdav process on stdin — the classic inetd contract.
+All crypto stays in a mature, dedicated tool; the program's only dependency is
+`libc`.
 
 ```
 client --TLS--> stunnel (terminates TLS, verifies client cert) --plaintext--> tiny-webdav
 ```
+
+Alternatively, with `--listen <addr>` tiny-webdav owns a plaintext TCP socket
+itself and forks a child per connection — no stunnel, no TLS. Handy on a trusted
+network or behind a TLS-terminating reverse proxy; see
+[Standalone mode](#standalone---listen-mode).
 
 ## Authentication
 
@@ -38,6 +44,8 @@ never an access decision.)
   connection is closed rather than risk a desync.
 - Mutating methods (`PUT`, `DELETE`, `MKCOL`, …) → `405`.
 - Path traversal (`..`) and out-of-root symlinks are rejected (as `404`).
+- Two ways to run: behind stunnel on stdin (the inetd contract), or standalone
+  with `--listen <addr>`, forking a child per connection.
 - Run as root, it `chroot`s into `--root` and drops privileges (see below).
 - One dependency: `libc`. No TLS stack, async runtime, or HTTP framework.
 
@@ -87,6 +95,7 @@ stderr (the systemd journal) — fine here.
 | Flag | Meaning | Default |
 |---|---|---|
 | `--root` | Directory to serve (read-only) | current dir |
+| `--listen` | Listen on `addr` (e.g. `127.0.0.1:8080`) and fork per connection; no TLS. Omit to serve one connection from stdin | *(stdin)* |
 | `--run-as` | User to chroot+drop to when started as root (must exist) | `nobody` |
 | `--log-file` | Write diagnostics here instead of stderr (required under xinetd) | *(stderr)* |
 | `--auth-file` | File of `username:password` lines (`#` comments; password may contain `:`) | *(none)* |
@@ -117,6 +126,31 @@ service tiny-webdav {
 }
 ```
 
+## Standalone (`--listen`) mode
+
+Skip stunnel entirely and let tiny-webdav own the socket:
+
+```sh
+tiny-webdav --root /srv/files --listen 0.0.0.0:8080
+```
+
+It binds the address, then forks a child per connection. There's **no TLS** —
+use this only on a trusted network, over a VPN/SSH tunnel, or behind a separate
+TLS terminator (stunnel, nginx, Caddy). Authentication is HTTP Basic only here
+(`--auth-file` / `--user`), since there's no TLS layer to carry client certs.
+
+Privilege handling mirrors the stunnel path. Start it **as root** to bind a
+privileged port (`< 1024`) and self-confine: the socket is bound while still
+root, then it `chroot`s into `--root` and drops to `--run-as` (default `nobody`)
+**once**, before the accept loop — every forked child inherits the chroot and
+unprivileged uid, and re-forbids forking for itself. Forking the already-running
+image is copy-on-write, with no `exec`. Started unprivileged (non-root, port
+`≥ 1024`) it simply serves as the current user.
+
+Children are reaped automatically (`SIGCHLD` ignored), so no zombies accumulate.
+Concurrency isn't capped — put it behind a proxy or a firewall if you need
+connection limits.
+
 ## Connect
 
 ```sh
@@ -144,19 +178,25 @@ drop is fatal, and it refuses to ever serve as root. Everything outside the root
 (the static binary, `/etc/passwd`, `--auth-file`, `--log-file`) is opened *before*
 the chroot, so the served directory itself needs nothing added to it.
 
-Always, as defense-in-depth: `PR_SET_NO_NEW_PRIVS` and zeroed *hard*
-`RLIMIT_CORE` / `RLIMIT_NPROC` (no privilege regain, no core dumps, no forking).
-seccomp is deliberately omitted. If stunnel drops privileges itself instead,
-tiny-webdav runs unprivileged and skips this step.
+Always, as defense-in-depth: `PR_SET_NO_NEW_PRIVS` and zeroed *hard* `RLIMIT_CORE`
+/ `RLIMIT_NPROC` (no privilege regain, no core dumps, no forking). seccomp is
+deliberately omitted. If stunnel drops privileges itself instead, tiny-webdav
+runs unprivileged and skips this step.
+
+In `--listen` mode the drop happens once, before the accept loop, so the forking
+parent keeps `RLIMIT_NPROC` (it *must* fork per connection) while each child
+zeroes it for itself — the process actually serving a client still can't fork.
 
 ## Security notes
 
 - Minimal by design: for trusted, low-traffic, read-only use — not a public,
   high-traffic fileserver.
 - **TLS, ciphers, and client-cert verification are stunnel's job** — keep it
-  patched; tiny-webdav contains no TLS code.
-- Concurrency and connection caps are stunnel's job (`per_source`,
-  `TIMEOUTidle`/`TIMEOUTbusy`). tiny-webdav adds only a best-effort per-socket
+  patched; tiny-webdav contains no TLS code. `--listen` mode has **no TLS at all**,
+  so only use it on a trusted network or behind a separate TLS terminator.
+- Concurrency and connection caps are the front's job — stunnel (`per_source`,
+  `TIMEOUTidle`/`TIMEOUTbusy`) or, in `--listen` mode, a proxy/firewall, since the
+  accept loop forks without a cap. tiny-webdav adds only a best-effort per-socket
   read/write `--timeout` so an idle kept-alive connection can't pin its process
   forever; a hung connection still only ties up its own process.
 - "Read-only" means no request can modify the served tree; the process only ever

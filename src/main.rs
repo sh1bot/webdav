@@ -1,6 +1,8 @@
-//! tiny-webdav: a small read-only WebDAV server, run behind stunnel (which
-//! terminates TLS) under the inetd contract — the decrypted connection arrives on
-//! stdin (fd 0); we serve one request and exit.
+//! tiny-webdav: a small read-only WebDAV server. By default it follows the inetd
+//! contract — a connection arrives on stdin (fd 0), typically from stunnel, which
+//! terminates TLS. With `--listen <addr>` it instead owns a plaintext TCP socket
+//! and forks a child per connection (no TLS). Either way a connection may carry
+//! several requests (HTTP keep-alive).
 //!
 //! Auth is layered: client certificates are stunnel's job (we only see the
 //! resulting `SSL_CLIENT_DN`), HTTP Basic is ours. Confinement is ours too: run
@@ -30,6 +32,7 @@ struct Args {
     run_as: Option<String>,
     timeout: u64,
     max_requests: u32,
+    listen: Option<String>,
 }
 
 fn usage() -> ! {
@@ -39,6 +42,9 @@ fn usage() -> ! {
            tiny-webdav [--root <dir>] [options]\n\n\
          OPTIONS:\n  \
            --root <dir>            Directory to serve (default: current directory)\n  \
+           --listen <addr>         Listen on addr (e.g. 127.0.0.1:8080) and fork a\n                          \
+                       child per connection. No TLS. Default: serve one\n                          \
+                       connection from stdin (the inetd/stunnel contract).\n  \
            --run-as <user>         When started as root, chroot into --root and\n                          \
                        drop to this user (default: nobody)\n  \
            --timeout <secs>        Per-read/write socket timeout, also bounding an\n                          \
@@ -67,12 +73,14 @@ fn parse_args() -> Args {
     let mut run_as: Option<String> = None;
     let mut timeout: u64 = 30;
     let mut max_requests: u32 = 100;
+    let mut listen: Option<String> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| usage());
         match arg.as_str() {
             "--root" => root = PathBuf::from(val()),
+            "--listen" => listen = Some(val()),
             "--auth-file" => auth_file = Some(PathBuf::from(val())),
             "--user" => user = Some(val()),
             "--password" => password = Some(val()),
@@ -104,6 +112,7 @@ fn parse_args() -> Args {
         run_as,
         timeout,
         max_requests,
+        listen,
     }
 }
 
@@ -166,6 +175,80 @@ fn serve_stdin(root: &Path, auth: &Auth, timeout: u64, max_requests: u32) {
 #[cfg(not(unix))]
 fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64, _max_requests: u32) {
     eprintln!("error: tiny-webdav is only supported on Unix platforms");
+    process::exit(1);
+}
+
+/// Standalone daemon mode (`--listen`): own the listening socket and fork a child
+/// per connection — no TLS, for running directly rather than behind stunnel.
+/// Privileges were already dropped once (before this loop), so each child inherits
+/// the chroot and unprivileged uid for free; forking the running image is
+/// copy-on-write, with no `exec`. The child moves the connection onto fd 0/1 and
+/// runs the very same serve loop as the inetd path.
+#[cfg(unix)]
+fn serve_listener(
+    listener: std::net::TcpListener,
+    root: &Path,
+    auth: &Auth,
+    timeout: u64,
+    max_requests: u32,
+) -> ! {
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
+
+    // Reap children automatically: with SIGCHLD ignored the kernel discards each
+    // child's exit status instead of leaving a zombie, so the accept loop needs
+    // no wait() bookkeeping.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+
+    let listen_fd = listener.as_raw_fd();
+    loop {
+        let stream = match listener.accept() {
+            Ok((s, _addr)) => s,
+            Err(e) => {
+                // A signal (EINTR) is normal; log anything else and keep serving.
+                if e.kind() != io::ErrorKind::Interrupted {
+                    eprintln!("accept error: {}", e);
+                }
+                continue;
+            }
+        };
+
+        match unsafe { libc::fork() } {
+            -1 => {
+                eprintln!("fork failed: {}", io::Error::last_os_error());
+                // Parent: drop this connection (below) and keep accepting.
+            }
+            0 => {
+                // Child: put the connection on fd 0 and fd 1 so the shared serve
+                // loop (reads 0, writes 1) works unchanged, release the listening
+                // socket, re-forbid forking for this process, then serve and exit.
+                let conn_fd = stream.into_raw_fd();
+                unsafe {
+                    libc::dup2(conn_fd, 0);
+                    libc::dup2(conn_fd, 1);
+                    if conn_fd > 1 {
+                        libc::close(conn_fd);
+                    }
+                    libc::close(listen_fd);
+                }
+                deny_rlimit(libc::RLIMIT_NPROC as _);
+                serve_stdin(root, auth, timeout, max_requests);
+                process::exit(0);
+            }
+            _ => { /* Parent: fall through to drop the connection. */ }
+        }
+        drop(stream); // Parent's copy of the connection; the child owns its own.
+    }
+}
+
+#[cfg(not(unix))]
+fn serve_listener(
+    _listener: std::net::TcpListener,
+    _root: &Path,
+    _auth: &Auth,
+    _timeout: u64,
+    _max_requests: u32,
+) -> ! {
+    eprintln!("error: --listen is only supported on Unix platforms");
     process::exit(1);
 }
 
@@ -242,13 +325,28 @@ fn main() {
         None => None,
     };
 
+    // In --listen mode, bind the socket *before* dropping privileges, so a
+    // privileged port (< 1024) can still be claimed while we're root. The bound
+    // socket survives the chroot untouched.
+    let listener = match &args.listen {
+        Some(addr) => match std::net::TcpListener::bind(addr) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("error: cannot listen on {}: {}", addr, e);
+                process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     // Everything taken from the command line is now open: --log-file is dup'd onto
     // fd 2 and --auth-file holds an fd, both before the chroot (the served files
     // live inside the chroot and are opened after it). Now confine: if we're root,
     // chroot into the served directory and drop to `nobody`; the returned path is
     // what we serve from ("/" once chrooted). If we aren't root (e.g. stunnel
     // already dropped us), this is a no-op and we serve the canonical root as-is.
-    let serve_root = lower_privileges(&canonical_root, args.run_as.as_deref());
+    // The listener forks a child per connection, so it keeps the ability to fork.
+    let serve_root = lower_privileges(&canonical_root, args.run_as.as_deref(), listener.is_some());
 
     // Now unprivileged: parse the (already-open) auth file and inline credentials.
     let auth = match build_auth(&args, auth_file) {
@@ -259,18 +357,27 @@ fn main() {
         }
     };
 
-    // We can't see the TLS layer, but stunnel exports SSL_CLIENT_DN when it has
-    // verified a client certificate. Treat that as authentication too, so a
-    // cert-only deployment isn't warned at. Warn only when a connection carries
-    // neither a verified client cert nor Basic credentials.
-    let client_cert = std::env::var("SSL_CLIENT_DN").is_ok_and(|v| !v.is_empty());
-    if !auth.is_enabled() && !client_cert {
-        eprintln!(
-            "WARNING: serving unauthenticated — no client cert (SSL_CLIENT_DN) and no Basic auth"
-        );
+    // Warn when nothing authenticates the client. In --listen mode there's no TLS
+    // and thus never a client certificate, so only Basic auth counts. Behind
+    // stunnel we can't see the TLS, but stunnel exports SSL_CLIENT_DN once it has
+    // verified a client cert — treat that as authentication so a cert-only
+    // deployment isn't warned at.
+    if !auth.is_enabled() {
+        match &args.listen {
+            Some(addr) => {
+                eprintln!("WARNING: serving unauthenticated on {} — no Basic auth", addr)
+            }
+            None if !std::env::var("SSL_CLIENT_DN").is_ok_and(|v| !v.is_empty()) => eprintln!(
+                "WARNING: serving unauthenticated — no client cert (SSL_CLIENT_DN) and no Basic auth"
+            ),
+            None => {}
+        }
     }
 
-    serve_stdin(&serve_root, &auth, args.timeout, args.max_requests);
+    match listener {
+        Some(l) => serve_listener(l, &serve_root, &auth, args.timeout, args.max_requests),
+        None => serve_stdin(&serve_root, &auth, args.timeout, args.max_requests),
+    }
 }
 
 /// Print a fatal error to stderr and exit non-zero.
@@ -308,7 +415,7 @@ fn deny_rlimit(resource: libc::c_int) {
 /// weren't already running as it. Returns the path to serve from: `/` once
 /// chrooted, else `root` unchanged.
 #[cfg(unix)]
-fn lower_privileges(root: &Path, run_as: Option<&str>) -> PathBuf {
+fn lower_privileges(root: &Path, run_as: Option<&str>, may_fork: bool) -> PathBuf {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -374,8 +481,11 @@ fn lower_privileges(root: &Path, run_as: Option<&str>) -> PathBuf {
     };
 
     // Forbid forking, done *after* any uid change: setuid to a user already at
-    // its RLIMIT_NPROC can fail, and we never fork anyway.
-    deny_rlimit(libc::RLIMIT_NPROC as _);
+    // its RLIMIT_NPROC can fail. Skipped for the --listen accept loop, which must
+    // fork a child per connection; each child re-forbids forking for itself.
+    if !may_fork {
+        deny_rlimit(libc::RLIMIT_NPROC as _);
+    }
 
     // Assert the privilege outcome by reading back the real, effective AND saved
     // uids. We must never end up with any of them as root.
@@ -408,7 +518,7 @@ fn lower_privileges(root: &Path, run_as: Option<&str>) -> PathBuf {
 }
 
 #[cfg(not(unix))]
-fn lower_privileges(root: &Path, _run_as: Option<&str>) -> PathBuf {
+fn lower_privileges(root: &Path, _run_as: Option<&str>, _may_fork: bool) -> PathBuf {
     root.to_path_buf()
 }
 
