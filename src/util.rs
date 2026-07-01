@@ -100,6 +100,44 @@ pub fn resolve_within(root: &Path, request_path: &str) -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// System / metadata entries that must be hidden even though they don't begin
+/// with a dot: NAS scratch dirs and Windows/macOS turds. Matched case-insensitively
+/// (the volumes that create them are case-insensitive).
+const HIDDEN_NAMES: &[&str] = &[
+    "@eaDir",                    // Synology thumbnails/metadata
+    "#recycle",                  // Synology recycle bin
+    "#snapshot",                 // Synology snapshots
+    "@Recycle",                  // QNAP recycle bin
+    "Thumbs.db",                 // Windows Explorer thumbnails
+    "ehthumbs.db",               // Windows video thumbnails
+    "Desktop.ini",               // Windows folder config
+    "$RECYCLE.BIN",              // Windows recycle bin
+    "System Volume Information", // Windows per-volume metadata
+    "Network Trash Folder",      // macOS on network shares
+    "Temporary Items",           // macOS on network shares
+    "lost+found",                // ext filesystem fsck recovery
+    "CVS",                       // CVS metadata dir
+    "RCS",                       // RCS metadata dir
+];
+
+/// True if `name` is a hidden system/metadata entry we never list or serve: any
+/// dotfile (`.git`, `.env`, `.htpasswd`, `.DS_Store`, …) or one of the known
+/// non-dot metadata names above (case-insensitive).
+pub fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.') || HIDDEN_NAMES.iter().any(|h| h.eq_ignore_ascii_case(name))
+}
+
+/// True if any segment of `request_path` is a hidden system entry — so that a
+/// request for `/dir/.htpasswd` or `/.git/config` is refused, not just omitted
+/// from listings. Only `Normal` components are checked (`.`/`..`/root are handled
+/// by `resolve_within`).
+pub fn path_has_hidden(request_path: &str) -> bool {
+    Path::new(request_path).components().any(|c| match c {
+        Component::Normal(seg) => seg.to_str().is_some_and(is_hidden_name),
+        _ => false,
+    })
+}
+
 /// Append a trailing slash to `path` if it doesn't already have one.
 pub fn with_trailing_slash(path: &str) -> String {
     if path.ends_with('/') {
@@ -289,4 +327,41 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_names_cover_dotfiles_and_system_entries() {
+        for n in [
+            ".htpasswd",
+            ".git",
+            ".env",
+            ".DS_Store",
+            "@eaDir",
+            "thumbs.db", // case-insensitive
+            "SYSTEM VOLUME INFORMATION",
+            "lost+found",
+        ] {
+            assert!(is_hidden_name(n), "{n} should be hidden");
+        }
+    }
+
+    #[test]
+    fn ordinary_names_are_not_hidden() {
+        for n in ["index.html", "photo.jpg", "notes", "git", "envelope.txt"] {
+            assert!(!is_hidden_name(n), "{n} should not be hidden");
+        }
+    }
+
+    #[test]
+    fn path_hidden_matches_any_segment() {
+        assert!(path_has_hidden("/dir/.htpasswd"));
+        assert!(path_has_hidden("/.git/config")); // hidden ancestor
+        assert!(path_has_hidden("/a/@eaDir/thumb.jpg"));
+        assert!(!path_has_hidden("/dir/sub/file.txt"));
+        assert!(!path_has_hidden("/"));
+    }
 }

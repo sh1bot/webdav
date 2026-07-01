@@ -19,6 +19,7 @@ pub fn handle<S: Write + AsRawFd>(
     root: &Path,
     auth: &Auth,
     req: &Request,
+    hide_system: bool,
 ) -> io::Result<()> {
     // Require valid Basic credentials (if configured) before doing anything.
     if !auth.authorize(req) {
@@ -34,11 +35,18 @@ pub fn handle<S: Write + AsRawFd>(
         None => return http::write_status(stream, 404, "Not Found"),
     };
 
+    // Hidden system entries (.htpasswd, .git, @eaDir, …) are never served: a
+    // request naming one is refused with the same reveal-nothing 404, so the
+    // deny is consistent with their omission from listings below.
+    if hide_system && util::path_has_hidden(&decoded) {
+        return http::write_status(stream, 404, "Not Found");
+    }
+
     match req.method.as_str() {
         "OPTIONS" => options(stream),
-        "GET" => get_or_head(stream, root, &decoded, &fs_path, req, true),
-        "HEAD" => get_or_head(stream, root, &decoded, &fs_path, req, false),
-        "PROPFIND" => propfind(stream, root, &decoded, &fs_path, req),
+        "GET" => get_or_head(stream, root, &decoded, &fs_path, req, true, hide_system),
+        "HEAD" => get_or_head(stream, root, &decoded, &fs_path, req, false, hide_system),
+        "PROPFIND" => propfind(stream, root, &decoded, &fs_path, req, hide_system),
         // Read-only: reject every mutating / unsupported method.
         _ => http::write_response(
             stream,
@@ -75,6 +83,7 @@ fn get_or_head<S: Write + AsRawFd>(
     fs_path: &Path,
     req: &Request,
     send_body: bool,
+    hide_system: bool,
 ) -> io::Result<()> {
     let meta = match stat_within_root(stream, root, fs_path)? {
         Some(m) => m,
@@ -83,7 +92,7 @@ fn get_or_head<S: Write + AsRawFd>(
 
     if meta.is_dir() {
         // GET on a collection returns a simple HTML index for browsers.
-        let html = directory_index_html(root, decoded_path, fs_path);
+        let html = directory_index_html(root, decoded_path, fs_path, hide_system);
         return http::write_response(
             stream,
             200,
@@ -398,10 +407,19 @@ struct IndexEntry {
     len: u64,
 }
 
-fn directory_index_html(root: &Path, decoded_path: &str, fs_path: &Path) -> String {
+fn directory_index_html(
+    root: &Path,
+    decoded_path: &str,
+    fs_path: &Path,
+    hide_system: bool,
+) -> String {
     let mut entries: Vec<IndexEntry> = Vec::new();
     if let Ok(rd) = fs::read_dir(fs_path) {
         for e in rd.flatten() {
+            // Hidden system entries are omitted (they're also refused on access).
+            if hide_system && util::is_hidden_name(&e.file_name().to_string_lossy()) {
+                continue;
+            }
             // Don't list entries (e.g. symlinks) that resolve outside the root.
             if !within_root(root, &e.path()) {
                 continue;
@@ -475,6 +493,7 @@ fn propfind<S: Write>(
     decoded_path: &str,
     fs_path: &Path,
     req: &Request,
+    hide_system: bool,
 ) -> io::Result<()> {
     let meta = match stat_within_root(stream, root, fs_path)? {
         Some(m) => m,
@@ -513,6 +532,10 @@ fn propfind<S: Write>(
         if let Ok(rd) = fs::read_dir(fs_path) {
             for entry in rd.flatten() {
                 let path = entry.path();
+                // Hidden system entries are omitted (and refused on direct access).
+                if hide_system && util::is_hidden_name(&entry.file_name().to_string_lossy()) {
+                    continue;
+                }
                 // Skip children that resolve outside the root (escaping symlinks).
                 if !within_root(root, &path) {
                     continue;

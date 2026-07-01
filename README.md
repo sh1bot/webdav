@@ -44,6 +44,9 @@ never an access decision.)
   connection is closed rather than risk a desync.
 - Mutating methods (`PUT`, `DELETE`, `MKCOL`, …) → `405`.
 - Path traversal (`..`) and out-of-root symlinks are rejected (as `404`).
+- Hidden system files — dotfiles (`.git`, `.env`, `.htpasswd`, …) and metadata
+  dirs (`@eaDir`, `Thumbs.db`, …) — are omitted from listings **and** refused on
+  direct access (`404`), so nothing is hidden-but-fetchable. `--serve-all` opts out.
 - Two ways to run: behind stunnel on stdin (the inetd contract), or standalone
   with `--listen <addr>`, forking a child per connection.
 - Run as root, it `chroot`s into `--root` and drops privileges (see below).
@@ -104,6 +107,7 @@ stderr (the systemd journal) — fine here.
 | `--timeout` | Per-read/write timeout in seconds, incl. the wait for the next keep-alive request (`0` disables) | `30` |
 | `--max-requests` | Max requests served on one connection before closing (`0` = unlimited) | `100` |
 | `-v`, `--verbose` | Log one line per request (method, path, status, conditional/range headers) to stderr | *(off)* |
+| `--serve-all` | Serve hidden system files too (dotfiles + metadata dirs); by default they're hidden and refused | *(hide)* |
 
 Client certificates are configured in stunnel, not here.
 
@@ -129,6 +133,24 @@ Note there's no conditional `PROPFIND` in WebDAV: a directory listing (`207`) is
 always regenerated, but it only carries metadata (names, sizes, mtimes, etags),
 so the client can diff it and issue conditional `GET`s for just the changed
 files.
+
+### Hidden system files
+
+By default the server treats these as if they weren't in the tree — omitted from
+the HTML index and PROPFIND, and answered with a reveal-nothing `404` on direct
+access (so a client can't probe for what wasn't listed):
+
+- **any dotfile** — every name beginning with `.` (`.git`, `.env`, `.htpasswd`,
+  `.ssh`, `.DS_Store`, …), matched on every path segment, so `/.git/config` is
+  refused because of its `.git` ancestor;
+- **known metadata names** (case-insensitive) — `@eaDir`, `#recycle`,
+  `Thumbs.db`, `Desktop.ini`, `System Volume Information`, `lost+found`, and a
+  handful of other NAS/Windows/macOS turds.
+
+The match is on the request path, matching how nginx/Apache do it. A non-hidden
+**symlink** whose target is a hidden file would still be followed — the filter
+doesn't rewrite what a deliberately-placed link points at. Pass `--serve-all` to
+disable hiding entirely.
 
 ### Under xinetd (optional)
 
