@@ -46,7 +46,8 @@ never an access decision.)
 - Path traversal (`..`) and out-of-root symlinks are rejected (as `404`).
 - Hidden system files — dotfiles (`.git`, `.env`, `.htpasswd`, …) and metadata
   dirs (`@eaDir`, `Thumbs.db`, …) — are omitted from listings **and** refused on
-  direct access (`404`), so nothing is hidden-but-fetchable. `--serve-all` opts out.
+  direct access (`404`), so nothing is hidden-but-fetchable. Re-expose individual
+  names with `--expose <glob>` (repeatable; `--expose '*'` serves everything).
 - Two ways to run: behind stunnel on stdin (the inetd contract), or standalone
   with `--listen <addr>`, forking a child per connection.
 - Run as root, it `chroot`s into `--root` and drops privileges (see below).
@@ -107,7 +108,7 @@ stderr (the systemd journal) — fine here.
 | `--timeout` | Per-read/write timeout in seconds, incl. the wait for the next keep-alive request (`0` disables) | `30` |
 | `--max-requests` | Max requests served on one connection before closing (`0` = unlimited) | `100` |
 | `-v`, `--verbose` | Log one line per request (method, path, status, conditional/range headers) to stderr | *(off)* |
-| `--serve-all` | Serve hidden system files too (dotfiles + metadata dirs); by default they're hidden and refused | *(hide)* |
+| `--expose` | Re-expose an otherwise-hidden name; glob with `*`/`?`, repeatable (`--expose .mpdignore`, `--expose '*'`) | *(none)* |
 
 Client certificates are configured in stunnel, not here.
 
@@ -147,10 +148,19 @@ access (so a client can't probe for what wasn't listed):
   `Thumbs.db`, `Desktop.ini`, `System Volume Information`, `lost+found`, and a
   handful of other NAS/Windows/macOS turds.
 
+To re-expose specific names, pass `--expose <glob>` (repeatable). The glob
+supports `*` and `?`, is case-sensitive, and matches a single path segment:
+
+```sh
+tiny-webdav --root /srv --expose .mpdignore     # serve just this dotfile
+tiny-webdav --root /srv --expose .well-known --expose '.*ignore'
+tiny-webdav --root /srv --expose '.*'           # all dotfiles (not metadata dirs)
+tiny-webdav --root /srv --expose '*'            # everything — the serve-all escape hatch
+```
+
 The match is on the request path, matching how nginx/Apache do it. A non-hidden
 **symlink** whose target is a hidden file would still be followed — the filter
-doesn't rewrite what a deliberately-placed link points at. Pass `--serve-all` to
-disable hiding entirely.
+doesn't rewrite what a deliberately-placed link points at.
 
 ### Under xinetd (optional)
 

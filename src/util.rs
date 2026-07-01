@@ -120,22 +120,63 @@ const HIDDEN_NAMES: &[&str] = &[
     "RCS",                       // RCS metadata dir
 ];
 
-/// True if `name` is a hidden system/metadata entry we never list or serve: any
-/// dotfile (`.git`, `.env`, `.htpasswd`, `.DS_Store`, …) or one of the known
-/// non-dot metadata names above (case-insensitive).
+/// True if `name` is a hidden system/metadata *name*: any dotfile (`.git`,
+/// `.env`, `.htpasswd`, `.DS_Store`, …) or one of the known non-dot metadata names
+/// above (case-insensitive). This is the base rule, before any `--expose`
+/// overrides are applied (see [`is_hidden`]).
 pub fn is_hidden_name(name: &str) -> bool {
     name.starts_with('.') || HIDDEN_NAMES.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
-/// True if any segment of `request_path` is a hidden system entry — so that a
+/// Whether `name` should be hidden and never served: a hidden system name that
+/// no `--expose` glob re-exposes. An override like `.mpdignore` un-hides that one
+/// name; `.*` un-hides all dotfiles; `*` un-hides everything.
+pub fn is_hidden(name: &str, exposes: &[String]) -> bool {
+    is_hidden_name(name) && !exposes.iter().any(|p| glob_match(p, name))
+}
+
+/// True if any segment of `request_path` is hidden (see [`is_hidden`]) — so a
 /// request for `/dir/.htpasswd` or `/.git/config` is refused, not just omitted
 /// from listings. Only `Normal` components are checked (`.`/`..`/root are handled
 /// by `resolve_within`).
-pub fn path_has_hidden(request_path: &str) -> bool {
+pub fn path_has_hidden(request_path: &str, exposes: &[String]) -> bool {
     Path::new(request_path).components().any(|c| match c {
-        Component::Normal(seg) => seg.to_str().is_some_and(is_hidden_name),
+        Component::Normal(seg) => seg.to_str().is_some_and(|s| is_hidden(s, exposes)),
         _ => false,
     })
+}
+
+/// Match `name` against a shell-style glob supporting `*` (any run, including
+/// empty) and `?` (exactly one character); case-sensitive, whole-string, no
+/// character classes. Used for `--expose` overrides.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = name.chars().collect();
+    let (mut pi, mut si) = (0, 0);
+    // Backtracking wildcard match: `star` remembers the last '*' in the pattern
+    // and `mark` how much of `name` it had consumed, so a later mismatch can make
+    // that '*' swallow one more character and retry.
+    let (mut star, mut mark): (Option<usize>, usize) = (None, 0);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Append a trailing slash to `path` if it doesn't already have one.
@@ -358,10 +399,39 @@ mod tests {
 
     #[test]
     fn path_hidden_matches_any_segment() {
-        assert!(path_has_hidden("/dir/.htpasswd"));
-        assert!(path_has_hidden("/.git/config")); // hidden ancestor
-        assert!(path_has_hidden("/a/@eaDir/thumb.jpg"));
-        assert!(!path_has_hidden("/dir/sub/file.txt"));
-        assert!(!path_has_hidden("/"));
+        let none: &[String] = &[];
+        assert!(path_has_hidden("/dir/.htpasswd", none));
+        assert!(path_has_hidden("/.git/config", none)); // hidden ancestor
+        assert!(path_has_hidden("/a/@eaDir/thumb.jpg", none));
+        assert!(!path_has_hidden("/dir/sub/file.txt", none));
+        assert!(!path_has_hidden("/", none));
+    }
+
+    #[test]
+    fn glob_matches_star_and_question() {
+        assert!(glob_match("*", ".anything"));
+        assert!(glob_match(".*", ".mpdignore"));
+        assert!(glob_match(".mpdignore", ".mpdignore"));
+        assert!(!glob_match(".mpdignore", ".mpdignorex"));
+        assert!(glob_match("*.log", "server.log"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+    }
+
+    #[test]
+    fn expose_overrides_hiding() {
+        let one = [".mpdignore".to_string()];
+        assert!(!is_hidden(".mpdignore", &one)); // exposed by name
+        assert!(is_hidden(".htpasswd", &one)); // still hidden
+                                               // Whole-tree escape hatches:
+        assert!(!is_hidden(".htpasswd", &["*".to_string()]));
+        assert!(!is_hidden(".git", &[".*".to_string()]));
+        // A non-hidden name is never hidden, with or without overrides.
+        assert!(!is_hidden("file.txt", &[]));
+        // Path gate honours the override too.
+        assert!(!path_has_hidden("/music/.mpdignore", &one));
+        assert!(path_has_hidden("/music/.git/x", &one));
     }
 }

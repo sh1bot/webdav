@@ -34,7 +34,7 @@ struct Args {
     max_requests: u32,
     listen: Option<String>,
     verbose: bool,
-    hide_system: bool,
+    exposes: Vec<String>,
 }
 
 fn usage() -> ! {
@@ -56,9 +56,11 @@ fn usage() -> ! {
            -v, --verbose           Log one line per request: method, path, status,\n                          \
                        and any conditional/range headers (If-Modified-Since,\n                          \
                        If-None-Match, If-Range, Range, Depth)\n  \
-           --serve-all             Serve hidden system files too. By default,\n                          \
-                       dotfiles (.git, .env, .htpasswd, …) and metadata dirs\n                          \
-                       (@eaDir, Thumbs.db, …) are hidden AND refused (404)\n  \
+           --expose <glob>         Re-expose an otherwise-hidden name (repeatable).\n                          \
+                       By default dotfiles (.git, .env, .htpasswd, …) and\n                          \
+                       metadata dirs (@eaDir, Thumbs.db, …) are hidden AND\n                          \
+                       refused (404). Globs use * and ?, matched per name:\n                          \
+                       e.g. --expose .mpdignore, or --expose '*' for all.\n  \
            --log-file <file>       Write diagnostics to this file. Default: stderr\n                          \
                        (captured by stunnel/systemd). Use this under xinetd,\n                          \
                        where stderr is the client socket.\n\n  \
@@ -83,7 +85,7 @@ fn parse_args() -> Args {
     let mut max_requests: u32 = 100;
     let mut listen: Option<String> = None;
     let mut verbose = false;
-    let mut hide_system = true;
+    let mut exposes: Vec<String> = Vec::new();
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -92,7 +94,7 @@ fn parse_args() -> Args {
             "--root" => root = PathBuf::from(val()),
             "--listen" => listen = Some(val()),
             "-v" | "--verbose" => verbose = true,
-            "--serve-all" => hide_system = false,
+            "--expose" => exposes.push(val()),
             "--auth-file" => auth_file = Some(PathBuf::from(val())),
             "--user" => user = Some(val()),
             "--password" => password = Some(val()),
@@ -126,7 +128,7 @@ fn parse_args() -> Args {
         max_requests,
         listen,
         verbose,
-        hide_system,
+        exposes,
     }
 }
 
@@ -157,7 +159,7 @@ fn serve_stdin(
     timeout: u64,
     max_requests: u32,
     verbose: bool,
-    hide_system: bool,
+    exposes: &[String],
 ) {
     use std::io::BufReader;
     use std::os::unix::io::FromRawFd;
@@ -184,7 +186,7 @@ fn serve_stdin(
         http::set_keep_alive(keep);
 
         let result =
-            dav::handle(&mut output, root, auth, &req, hide_system).and_then(|()| output.flush());
+            dav::handle(&mut output, root, auth, &req, exposes).and_then(|()| output.flush());
         if verbose {
             log_request(&req, http::last_status());
         }
@@ -205,7 +207,7 @@ fn serve_stdin(
     _timeout: u64,
     _max_requests: u32,
     _verbose: bool,
-    _hide_system: bool,
+    _exposes: &[String],
 ) {
     eprintln!("error: tiny-webdav is only supported on Unix platforms");
     process::exit(1);
@@ -320,7 +322,7 @@ fn serve_listener(
     timeout: u64,
     max_requests: u32,
     verbose: bool,
-    hide_system: bool,
+    exposes: &[String],
 ) -> ! {
     use std::os::unix::io::{AsRawFd, IntoRawFd};
 
@@ -361,7 +363,7 @@ fn serve_listener(
                     libc::close(listen_fd);
                 }
                 deny_rlimit(libc::RLIMIT_NPROC as _);
-                serve_stdin(root, auth, timeout, max_requests, verbose, hide_system);
+                serve_stdin(root, auth, timeout, max_requests, verbose, exposes);
                 process::exit(0);
             }
             _ => { /* Parent: fall through to drop the connection. */ }
@@ -378,7 +380,7 @@ fn serve_listener(
     _timeout: u64,
     _max_requests: u32,
     _verbose: bool,
-    _hide_system: bool,
+    _exposes: &[String],
 ) -> ! {
     eprintln!("error: --listen is only supported on Unix platforms");
     process::exit(1);
@@ -514,7 +516,7 @@ fn main() {
             args.timeout,
             args.max_requests,
             args.verbose,
-            args.hide_system,
+            &args.exposes,
         ),
         None => serve_stdin(
             &serve_root,
@@ -522,7 +524,7 @@ fn main() {
             args.timeout,
             args.max_requests,
             args.verbose,
-            args.hide_system,
+            &args.exposes,
         ),
     }
 }
