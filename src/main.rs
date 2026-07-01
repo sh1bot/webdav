@@ -33,6 +33,7 @@ struct Args {
     timeout: u64,
     max_requests: u32,
     listen: Option<String>,
+    verbose: bool,
 }
 
 fn usage() -> ! {
@@ -51,6 +52,9 @@ fn usage() -> ! {
                        idle keep-alive connection (default: 30, 0 = none)\n  \
            --max-requests <n>      Max requests per persistent connection\n                          \
                        (default: 100, 0 = unlimited)\n  \
+           -v, --verbose           Log one line per request: method, path, status,\n                          \
+                       and any conditional/range headers (If-Modified-Since,\n                          \
+                       If-None-Match, If-Range, Range, Depth)\n  \
            --log-file <file>       Write diagnostics to this file. Default: stderr\n                          \
                        (captured by stunnel/systemd). Use this under xinetd,\n                          \
                        where stderr is the client socket.\n\n  \
@@ -74,6 +78,7 @@ fn parse_args() -> Args {
     let mut timeout: u64 = 30;
     let mut max_requests: u32 = 100;
     let mut listen: Option<String> = None;
+    let mut verbose = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -81,6 +86,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--root" => root = PathBuf::from(val()),
             "--listen" => listen = Some(val()),
+            "-v" | "--verbose" => verbose = true,
             "--auth-file" => auth_file = Some(PathBuf::from(val())),
             "--user" => user = Some(val()),
             "--password" => password = Some(val()),
@@ -113,6 +119,7 @@ fn parse_args() -> Args {
         timeout,
         max_requests,
         listen,
+        verbose,
     }
 }
 
@@ -137,7 +144,7 @@ fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
 /// for successive requests (HTTP keep-alive) until the client closes it, asks to
 /// close, an error/timeout occurs, or `--max-requests` is reached.
 #[cfg(unix)]
-fn serve_stdin(root: &Path, auth: &Auth, timeout: u64, max_requests: u32) {
+fn serve_stdin(root: &Path, auth: &Auth, timeout: u64, max_requests: u32, verbose: bool) {
     use std::io::BufReader;
     use std::os::unix::io::FromRawFd;
 
@@ -162,7 +169,11 @@ fn serve_stdin(root: &Path, auth: &Auth, timeout: u64, max_requests: u32) {
         let keep = req.keep_alive() && (max_requests == 0 || served < max_requests);
         http::set_keep_alive(keep);
 
-        if let Err(e) = dav::handle(&mut output, root, auth, &req).and_then(|()| output.flush()) {
+        let result = dav::handle(&mut output, root, auth, &req).and_then(|()| output.flush());
+        if verbose {
+            log_request(&req, http::last_status());
+        }
+        if let Err(e) = result {
             eprintln!("connection error: {}", e);
             break;
         }
@@ -173,9 +184,29 @@ fn serve_stdin(root: &Path, auth: &Auth, timeout: u64, max_requests: u32) {
 }
 
 #[cfg(not(unix))]
-fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64, _max_requests: u32) {
+fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64, _max_requests: u32, _verbose: bool) {
     eprintln!("error: tiny-webdav is only supported on Unix platforms");
     process::exit(1);
+}
+
+/// One-line request log for `--verbose`: method, path, response status, and any
+/// conditional/range headers — the fields that reveal a "changes since <date>"
+/// or cached-copy request (so a `304`/`206` shows the client was spared a
+/// re-fetch, while a plain `200` for data it already holds stands out).
+fn log_request(req: &http::Request, status: u16) {
+    let mut line = format!("{} {} {} -> {}", req.method, req.path, req.version, status);
+    for name in [
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "range",
+        "depth",
+    ] {
+        if let Some(v) = req.header(name) {
+            line.push_str(&format!(" {}={:?}", name, v));
+        }
+    }
+    eprintln!("{}", line);
 }
 
 /// Bind a listening TCP socket with `SO_REUSEADDR`, so a quick restart isn't
@@ -266,6 +297,7 @@ fn serve_listener(
     auth: &Auth,
     timeout: u64,
     max_requests: u32,
+    verbose: bool,
 ) -> ! {
     use std::os::unix::io::{AsRawFd, IntoRawFd};
 
@@ -306,7 +338,7 @@ fn serve_listener(
                     libc::close(listen_fd);
                 }
                 deny_rlimit(libc::RLIMIT_NPROC as _);
-                serve_stdin(root, auth, timeout, max_requests);
+                serve_stdin(root, auth, timeout, max_requests, verbose);
                 process::exit(0);
             }
             _ => { /* Parent: fall through to drop the connection. */ }
@@ -322,6 +354,7 @@ fn serve_listener(
     _auth: &Auth,
     _timeout: u64,
     _max_requests: u32,
+    _verbose: bool,
 ) -> ! {
     eprintln!("error: --listen is only supported on Unix platforms");
     process::exit(1);
@@ -450,8 +483,21 @@ fn main() {
     }
 
     match listener {
-        Some(l) => serve_listener(l, &serve_root, &auth, args.timeout, args.max_requests),
-        None => serve_stdin(&serve_root, &auth, args.timeout, args.max_requests),
+        Some(l) => serve_listener(
+            l,
+            &serve_root,
+            &auth,
+            args.timeout,
+            args.max_requests,
+            args.verbose,
+        ),
+        None => serve_stdin(
+            &serve_root,
+            &auth,
+            args.timeout,
+            args.max_requests,
+            args.verbose,
+        ),
     }
 }
 

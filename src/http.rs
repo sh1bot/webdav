@@ -28,6 +28,20 @@ pub fn set_keep_alive(v: bool) {
     KEEP_ALIVE.with(|k| k.set(v));
 }
 
+thread_local! {
+    /// Status of the most recent response, recorded by `write_head` (the single
+    /// choke point every response passes through). Read by the serve loop for
+    /// `--verbose` request logging, so the status needn't be plumbed back through
+    /// every handler return. Same single-threaded, one-connection rationale as
+    /// `KEEP_ALIVE`.
+    static LAST_STATUS: Cell<u16> = const { Cell::new(0) };
+}
+
+/// The status code of the response most recently written (see [`write_head`]).
+pub fn last_status() -> u16 {
+    LAST_STATUS.with(|s| s.get())
+}
+
 pub struct Request {
     pub method: String,
     pub path: String,
@@ -195,6 +209,7 @@ pub fn write_head<S: Write>(
     extra_headers: &[(&str, String)],
     content_length: u64,
 ) -> io::Result<()> {
+    LAST_STATUS.with(|s| s.set(status));
     let mut head = String::new();
     let _ = write!(head, "HTTP/1.1 {} {}\r\n", status, reason);
     let _ = write!(head, "Content-Length: {}\r\n", content_length);

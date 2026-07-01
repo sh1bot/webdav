@@ -103,8 +103,32 @@ stderr (the systemd journal) — fine here.
 | `--realm` | Basic-auth realm | `tiny-webdav` |
 | `--timeout` | Per-read/write timeout in seconds, incl. the wait for the next keep-alive request (`0` disables) | `30` |
 | `--max-requests` | Max requests served on one connection before closing (`0` = unlimited) | `100` |
+| `-v`, `--verbose` | Log one line per request (method, path, status, conditional/range headers) to stderr | *(off)* |
 
 Client certificates are configured in stunnel, not here.
+
+### Watching request traffic (`-v`)
+
+`-v` logs one line per request to stderr (so it lands in `--log-file`, the
+journal, or stunnel's log), including any conditional/range headers. It's handy
+for confirming a syncing client only refetches what actually changed:
+
+```
+GET /photos/a.jpg HTTP/1.1 -> 304 if-none-match="\"1a-6a40b279\""
+GET /photos/b.jpg HTTP/1.1 -> 304 if-modified-since="Tue, 01 Jul 2026 …"
+GET /photos/new.jpg HTTP/1.1 -> 200 if-modified-since="Tue, 01 Jul 2026 …"
+PROPFIND /photos/ HTTP/1.1 -> 207 depth="1"
+```
+
+- A `304` (or `206` for a resumed range) means the client sent a validator and
+  was spared the transfer — the efficient path.
+- A plain `200` with **no** `if-*` header for data the client already holds is
+  the tell-tale of a client re-scanning instead of asking "changed since?".
+
+Note there's no conditional `PROPFIND` in WebDAV: a directory listing (`207`) is
+always regenerated, but it only carries metadata (names, sizes, mtimes, etags),
+so the client can diff it and issue conditional `GET`s for just the changed
+files.
 
 ### Under xinetd (optional)
 
