@@ -148,8 +148,9 @@ image is copy-on-write, with no `exec`. Started unprivileged (non-root, port
 `≥ 1024`) it simply serves as the current user.
 
 Children are reaped automatically (`SIGCHLD` ignored), so no zombies accumulate.
-Concurrency isn't capped — put it behind a proxy or a firewall if you need
-connection limits.
+The socket is bound with `SO_REUSEADDR`, so a restart isn't refused while a
+just-closed connection lingers in `TIME_WAIT`. Concurrency isn't capped — put it
+behind a proxy or a firewall if you need connection limits.
 
 ## Connect
 

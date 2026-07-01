@@ -178,6 +178,81 @@ fn serve_stdin(_root: &Path, _auth: &Auth, _timeout: u64, _max_requests: u32) {
     process::exit(1);
 }
 
+/// Bind a listening TCP socket with `SO_REUSEADDR`, so a quick restart isn't
+/// refused while a just-closed connection still lingers in `TIME_WAIT`. Rust's
+/// `TcpListener::bind` doesn't set the option, and it must be set *before* bind,
+/// so we build the socket by hand. `addr` is `host:port` (a literal IPv4/IPv6
+/// address works too); only the first resolved address is tried.
+#[cfg(unix)]
+fn bind_listener(addr: &str) -> io::Result<std::net::TcpListener> {
+    use std::net::{SocketAddr, ToSocketAddrs};
+    use std::os::unix::io::FromRawFd;
+
+    let resolved = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to bind"))?;
+
+    // Lay the resolved address into a sockaddr_storage for bind().
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let (family, len) = match resolved {
+        SocketAddr::V4(v4) => {
+            let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            // octets() are already in network order; from_ne_bytes keeps that
+            // byte layout in s_addr regardless of host endianness.
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            };
+            (libc::AF_INET, std::mem::size_of::<libc::sockaddr_in>())
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sin6.sin6_scope_id = v6.scope_id();
+            (libc::AF_INET6, std::mem::size_of::<libc::sockaddr_in6>())
+        }
+    };
+
+    unsafe {
+        let fd = libc::socket(family, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Own the fd immediately so it's closed on any early return below.
+        let listener = std::net::TcpListener::from_raw_fd(fd);
+
+        let one: libc::c_int = 1;
+        let ok = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
+            && libc::bind(
+                fd,
+                (&storage as *const libc::sockaddr_storage).cast(),
+                len as libc::socklen_t,
+            ) == 0
+            && libc::listen(fd, libc::SOMAXCONN) == 0;
+        if !ok {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(listener)
+    }
+}
+
+#[cfg(not(unix))]
+fn bind_listener(addr: &str) -> io::Result<std::net::TcpListener> {
+    std::net::TcpListener::bind(addr)
+}
+
 /// Standalone daemon mode (`--listen`): own the listening socket and fork a child
 /// per connection — no TLS, for running directly rather than behind stunnel.
 /// Privileges were already dropped once (before this loop), so each child inherits
@@ -329,7 +404,7 @@ fn main() {
     // privileged port (< 1024) can still be claimed while we're root. The bound
     // socket survives the chroot untouched.
     let listener = match &args.listen {
-        Some(addr) => match std::net::TcpListener::bind(addr) {
+        Some(addr) => match bind_listener(addr) {
             Ok(l) => Some(l),
             Err(e) => {
                 eprintln!("error: cannot listen on {}: {}", addr, e);
