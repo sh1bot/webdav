@@ -18,5 +18,8 @@ path = "src/main.rs"
 libc = "0.2"
 
 [profile.release]
-opt-level = 2
+opt-level = "z"     # optimize for size (we're I/O-bound; sendfile does the work)
+lto = true         # cross-crate dead-code elimination
+codegen-units = 1  # whole-program optimization, at the cost of build time
+panic = "abort"    # no unwinding tables; a panic just aborts the connection process
 strip = true
