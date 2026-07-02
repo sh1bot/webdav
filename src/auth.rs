@@ -3,9 +3,10 @@
 //! by stunnel in front of us.
 //!
 //! Credentials are read from a file (`user:password` per line) and/or a single
-//! inline `--user`/`--password` pair. If no credentials are configured, Basic
-//! auth is disabled. When enabled, every request must carry valid
-//! `Authorization: Basic` credentials.
+//! inline `--auth user:password` pair — the same `user:password` syntax either
+//! way, via [`Auth::add_pair`]. If no credentials are configured, Basic auth is
+//! disabled. When enabled, every request must carry valid `Authorization: Basic`
+//! credentials.
 //!
 //! Basic auth sends the password in (base64 of) cleartext, which is fine here
 //! because stunnel has already encrypted the entire connection with TLS.
@@ -33,15 +34,24 @@ impl Auth {
         !self.creds.is_empty()
     }
 
-    /// Add a single `username` / `password` credential.
-    pub fn add(&mut self, username: String, password: String) {
-        self.creds.insert(username, password);
+    /// Parse and add a single `username:password` credential (only the first
+    /// colon separates them, so the password may itself contain `:`). The one
+    /// splitting rule shared by an `--auth-file` line and the inline `--auth`
+    /// flag.
+    pub fn add_pair(&mut self, user_pass: &str) -> Result<(), &'static str> {
+        match user_pass.split_once(':') {
+            Some((user, pass)) if !user.is_empty() => {
+                self.creds.insert(user.to_string(), pass.to_string());
+                Ok(())
+            }
+            _ => Err("expected 'username:password'"),
+        }
     }
 
     /// Load `username:password` lines from a file. Blank lines and lines
-    /// starting with `#` are ignored. The password may itself contain `:`.
-    /// Reads from an already-open `reader` (so the file can be opened before a
-    /// chroot/privilege drop and parsed afterwards); `source` only labels errors.
+    /// starting with `#` are ignored. Reads from an already-open `reader` (so
+    /// the file can be opened before a chroot/privilege drop and parsed
+    /// afterwards); `source` only labels errors.
     pub fn load(&mut self, mut reader: impl Read, source: &str) -> io::Result<()> {
         let mut text = String::new();
         reader.read_to_string(&mut text)?;
@@ -50,17 +60,12 @@ impl Auth {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            match line.split_once(':') {
-                Some((user, pass)) if !user.is_empty() => {
-                    self.creds.insert(user.to_string(), pass.to_string());
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{}:{}: expected 'username:password'", source, lineno + 1),
-                    ));
-                }
-            }
+            self.add_pair(line).map_err(|msg| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}:{}: {}", source, lineno + 1, msg),
+                )
+            })?;
         }
         Ok(())
     }

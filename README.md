@@ -22,7 +22,7 @@ Two independent layers; use either, both, or neither:
 
 - **Client certificate (mutual TLS)** — enforced by **stunnel** (`CAfile` +
   `verify`); tiny-webdav never sees the TLS.
-- **HTTP Basic** — enforced by **tiny-webdav** (`--auth-file` / `--user`).
+- **HTTP Basic** — enforced by **tiny-webdav** (`--auth-file` / `--auth`).
 
 With neither configured, access is anonymous and tiny-webdav logs a warning. It
 detects a verified client cert from the `SSL_CLIENT_DN` variable stunnel sets, so
@@ -113,7 +113,7 @@ stderr (the systemd journal) — fine here.
 | `--run-as` | User to chroot+drop to when started as root (must exist) | `nobody` |
 | `--log-file` | Write diagnostics here instead of stderr (required under xinetd) | *(stderr)* |
 | `--auth-file` | File of `username:password` lines (`#` comments; password may contain `:`) | *(none)* |
-| `--user` / `--password` | A single inline credential | *(none)* |
+| `--auth` | An inline `username:password` credential (repeatable) | *(none)* |
 | `--realm` | Basic-auth realm | `tiny-webdav` |
 | `--timeout` | Per-read/write timeout in seconds, incl. the wait for the next keep-alive request (`0` disables) | `30` |
 | `--max-requests` | Max requests served on one connection before closing (`0` = unlimited) | `100` |
@@ -202,7 +202,7 @@ tiny-webdav --root /srv/files --listen 0.0.0.0:8080
 It binds the address, then forks a child per connection. There's **no TLS** —
 use this only on a trusted network, over a VPN/SSH tunnel, or behind a separate
 TLS terminator (stunnel, nginx, Caddy). Authentication is HTTP Basic only here
-(`--auth-file` / `--user`), since there's no TLS layer to carry client certs.
+(`--auth-file` / `--auth`), since there's no TLS layer to carry client certs.
 
 Privilege handling mirrors the stunnel path. Start it **as root** to bind a
 privileged port (`< 1024`) and self-confine: the socket is bound while still

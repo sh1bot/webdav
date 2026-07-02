@@ -25,8 +25,7 @@ use auth::Auth;
 struct Args {
     root: PathBuf,
     auth_file: Option<PathBuf>,
-    user: Option<String>,
-    password: Option<String>,
+    auth: Vec<String>,
     realm: String,
     log_file: Option<PathBuf>,
     run_as: Option<String>,
@@ -69,8 +68,8 @@ OPTIONS:
 
   HTTP Basic auth (client certs are handled by stunnel, not here):
   --auth-file <file>      File of 'username:password' lines (# comments)
-  --user <name>           A single username (use with --password)
-  --password <pass>       Password for --user
+  --auth <user:pass>      An inline credential (repeatable; password may
+                          contain ':')
   --realm <realm>         Basic-auth realm shown to clients (default: tiny-webdav)
 "
     );
@@ -80,8 +79,7 @@ OPTIONS:
 fn parse_args() -> Args {
     let mut root = PathBuf::from(".");
     let mut auth_file: Option<PathBuf> = None;
-    let mut user: Option<String> = None;
-    let mut password: Option<String> = None;
+    let mut auth: Vec<String> = Vec::new();
     let mut realm = "tiny-webdav".to_string();
     let mut log_file: Option<PathBuf> = None;
     let mut run_as: Option<String> = None;
@@ -100,8 +98,7 @@ fn parse_args() -> Args {
             "-v" | "--verbose" => verbose = true,
             "--expose" => exposes.push(val()),
             "--auth-file" => auth_file = Some(PathBuf::from(val())),
-            "--user" => user = Some(val()),
-            "--password" => password = Some(val()),
+            "--auth" => auth.push(val()),
             "--realm" => realm = val(),
             "--log-file" => log_file = Some(PathBuf::from(val())),
             "--run-as" => run_as = Some(val()),
@@ -115,16 +112,10 @@ fn parse_args() -> Args {
         }
     }
 
-    if user.is_some() != password.is_some() {
-        eprintln!("error: --user and --password must be given together\n");
-        usage();
-    }
-
     Args {
         root,
         auth_file,
-        user,
-        password,
+        auth,
         realm,
         log_file,
         run_as,
@@ -145,8 +136,10 @@ fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
         let source = args.auth_file.as_deref().unwrap_or(Path::new("-"));
         auth.load(file, &source.display().to_string())?;
     }
-    if let (Some(u), Some(p)) = (&args.user, &args.password) {
-        auth.add(u.clone(), p.clone());
+    for pair in &args.auth {
+        auth.add_pair(pair).map_err(|msg| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("--auth: {}", msg))
+        })?;
     }
     Ok(auth)
 }
