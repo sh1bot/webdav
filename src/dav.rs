@@ -2,6 +2,7 @@
 //! Anything that would modify the filesystem (PUT, DELETE, MKCOL, COPY,
 //! MOVE, PROPPATCH, LOCK, …) is answered with 405 Method Not Allowed.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
@@ -14,12 +15,19 @@ use crate::util;
 
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND";
 
+/// The static, per-server configuration every handler needs: the served root
+/// (for the symlink-escape check) and the `--expose` overrides (for the hidden-
+/// file gate). Bundled since the two always travel together.
+pub struct Served<'a> {
+    pub root: &'a Path,
+    pub exposes: &'a [String],
+}
+
 pub fn handle<S: Write + AsRawFd>(
     stream: &mut S,
-    root: &Path,
+    served: &Served,
     auth: &Auth,
     req: &Request,
-    exposes: &[String],
 ) -> io::Result<()> {
     // Require valid Basic credentials (if configured) before doing anything.
     if !auth.authorize(req) {
@@ -30,29 +38,28 @@ pub fn handle<S: Write + AsRawFd>(
     // escape is reported as 404 (not 403), like an out-of-root symlink, so the
     // response never reveals that the traversal filter (or a chroot) is in play.
     let decoded = util::percent_decode(&req.path);
-    let fs_path = match util::resolve_within(root, &decoded) {
+    let fs_path = match util::resolve_within(served.root, &decoded) {
         Some(p) => p,
-        None => return http::write_status(stream, 404, "Not Found"),
+        None => return http::write_status(stream, 404),
     };
 
     // Hidden system entries (.htpasswd, .git, @eaDir, …) are never served unless
     // re-exposed by an `--expose` glob: a request naming a still-hidden one is
     // refused with the same reveal-nothing 404, consistent with its omission from
     // the listings below.
-    if util::path_has_hidden(&decoded, exposes) {
-        return http::write_status(stream, 404, "Not Found");
+    if util::path_has_hidden(&decoded, served.exposes) {
+        return http::write_status(stream, 404);
     }
 
     match req.method.as_str() {
         "OPTIONS" => options(stream),
-        "GET" => get_or_head(stream, root, &decoded, &fs_path, req, true, exposes),
-        "HEAD" => get_or_head(stream, root, &decoded, &fs_path, req, false, exposes),
-        "PROPFIND" => propfind(stream, root, &decoded, &fs_path, req, exposes),
+        "GET" => get_or_head(stream, served, &decoded, &fs_path, req, true),
+        "HEAD" => get_or_head(stream, served, &decoded, &fs_path, req, false),
+        "PROPFIND" => propfind(stream, served, &decoded, &fs_path, req),
         // Read-only: reject every mutating / unsupported method.
         _ => http::write_response(
             stream,
             405,
-            "Method Not Allowed",
             "text/plain; charset=utf-8",
             &[("Allow", ALLOW.to_string())],
             b"405 Method Not Allowed\n",
@@ -65,7 +72,6 @@ fn options<S: Write>(stream: &mut S) -> io::Result<()> {
     http::write_response(
         stream,
         200,
-        "OK",
         "",
         &[
             // DAV: 1 is all a read-only browser/list server needs to advertise.
@@ -79,25 +85,23 @@ fn options<S: Write>(stream: &mut S) -> io::Result<()> {
 
 fn get_or_head<S: Write + AsRawFd>(
     stream: &mut S,
-    root: &Path,
+    served: &Served,
     decoded_path: &str,
     fs_path: &Path,
     req: &Request,
     send_body: bool,
-    exposes: &[String],
 ) -> io::Result<()> {
-    let meta = match stat_within_root(stream, root, fs_path)? {
+    let meta = match stat_within_root(stream, served.root, fs_path)? {
         Some(m) => m,
         None => return Ok(()),
     };
 
     if meta.is_dir() {
         // GET on a collection returns a simple HTML index for browsers.
-        let html = directory_index_html(root, decoded_path, fs_path, exposes);
+        let html = directory_index_html(served, decoded_path, fs_path);
         return http::write_response(
             stream,
             200,
-            "OK",
             "text/html; charset=utf-8",
             &[],
             html.as_bytes(),
@@ -111,23 +115,11 @@ fn get_or_head<S: Write + AsRawFd>(
 
     // Conditional GET: If-None-Match / If-Modified-Since => 304 Not Modified.
     if not_modified(req, etag.as_deref(), modified) {
-        let mut h: Vec<(&str, String)> = Vec::new();
-        if let Some(e) = &etag {
-            h.push(("ETag", e.clone()));
-        }
-        if let Some(m) = modified {
-            h.push(("Last-Modified", util::http_date(m)));
-        }
-        return http::write_response(stream, 304, "Not Modified", "", &h, b"", false);
+        let headers = validator_headers(etag.as_deref(), modified);
+        return http::write_response(stream, 304, "", &headers, b"", false);
     }
 
-    let mut headers: Vec<(&str, String)> = Vec::new();
-    if let Some(m) = modified {
-        headers.push(("Last-Modified", util::http_date(m)));
-    }
-    if let Some(e) = &etag {
-        headers.push(("ETag", e.clone()));
-    }
+    let mut headers = validator_headers(etag.as_deref(), modified);
     // We honour single byte ranges; advertise that to clients.
     headers.push(("Accept-Ranges", "bytes".to_string()));
 
@@ -149,7 +141,6 @@ fn get_or_head<S: Write + AsRawFd>(
             headers.push(("Content-Range", format!("bytes {}-{}/{}", start, end, len)));
             let resp = Resp {
                 status: 206,
-                reason: "Partial Content",
                 content_type,
                 headers: &headers,
             };
@@ -159,7 +150,6 @@ fn get_or_head<S: Write + AsRawFd>(
         RangeSpec::Unsatisfiable => http::write_response(
             stream,
             416,
-            "Range Not Satisfiable",
             "text/plain; charset=utf-8",
             &[("Content-Range", format!("bytes */{}", len))],
             b"416 Range Not Satisfiable\n",
@@ -169,7 +159,6 @@ fn get_or_head<S: Write + AsRawFd>(
         RangeSpec::Ignore => {
             let resp = Resp {
                 status: 200,
-                reason: "OK",
                 content_type,
                 headers: &headers,
             };
@@ -178,10 +167,24 @@ fn get_or_head<S: Write + AsRawFd>(
     }
 }
 
+/// Build the `Last-Modified`/`ETag` headers shared by the 304 and 200/206 paths.
+fn validator_headers(
+    etag: Option<&str>,
+    modified: Option<SystemTime>,
+) -> Vec<(&'static str, String)> {
+    let mut h = Vec::new();
+    if let Some(m) = modified {
+        h.push(("Last-Modified", util::http_date(m)));
+    }
+    if let Some(e) = etag {
+        h.push(("ETag", e.to_string()));
+    }
+    h
+}
+
 /// The status line + headers for a streamed file response.
 struct Resp<'a> {
     status: u16,
-    reason: &'a str,
     content_type: &'a str,
     headers: &'a [(&'a str, String)],
 }
@@ -206,14 +209,7 @@ fn stream_file<S: Write + AsRawFd>(
         Err(e) => return err_status(stream, &e),
     };
 
-    http::write_head(
-        stream,
-        resp.status,
-        resp.reason,
-        resp.content_type,
-        resp.headers,
-        count,
-    )?;
+    http::write_head(stream, resp.status, resp.content_type, resp.headers, count)?;
     if send_body {
         http::send_file(stream.as_raw_fd(), &file, offset, count)?;
     } else {
@@ -236,18 +232,19 @@ fn stat_within_root<S: Write>(
         Err(e) => return err_status(stream, &e).map(|()| None),
     };
     if !within_root(root, fs_path) {
-        return http::write_status(stream, 404, "Not Found").map(|()| None);
+        return http::write_status(stream, 404).map(|()| None);
     }
     Ok(Some(meta))
 }
 
 /// Map a filesystem error to the appropriate HTTP status response.
 fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
-    match e.kind() {
-        io::ErrorKind::NotFound => http::write_status(stream, 404, "Not Found"),
-        io::ErrorKind::PermissionDenied => http::write_status(stream, 403, "Forbidden"),
-        _ => http::write_status(stream, 500, "Internal Server Error"),
-    }
+    let status = match e.kind() {
+        io::ErrorKind::NotFound => 404,
+        io::ErrorKind::PermissionDenied => 403,
+        _ => 500,
+    };
+    http::write_status(stream, status)
 }
 
 /// True if `fs_path`, fully resolved (following symlinks), is still inside
@@ -284,6 +281,23 @@ fn etag_list_matches(header: &str, etag: &str) -> bool {
             .any(|t| t == etag)
 }
 
+/// True if an HTTP-date header value is at or after `modified` — i.e. the
+/// client's cached copy is still current. Shared by `If-Modified-Since` and the
+/// date form of `If-Range`; both compare at one-second resolution (`as_secs`),
+/// matching what `Last-Modified` itself was rendered from.
+fn date_covers(header_val: &str, modified: SystemTime) -> bool {
+    let Some(since) = util::parse_http_date(header_val) else {
+        return false;
+    };
+    let Ok(mtime) = modified
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+    else {
+        return false;
+    };
+    mtime <= since
+}
+
 /// Evaluate conditional-GET preconditions. Returns true when the client's
 /// cached copy is still current and we should answer `304 Not Modified`.
 /// `If-None-Match` takes precedence over `If-Modified-Since` (RFC 7232).
@@ -291,15 +305,10 @@ fn not_modified(req: &Request, etag: Option<&str>, modified: Option<SystemTime>)
     if let Some(inm) = req.header("if-none-match") {
         return etag.map(|e| etag_list_matches(inm, e)).unwrap_or(false);
     }
-    if let (Some(ims), Some(m)) = (req.header("if-modified-since"), modified) {
-        if let (Some(since), Ok(mtime)) = (
-            util::parse_http_date(ims),
-            m.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64),
-        ) {
-            return mtime <= since;
-        }
+    match (req.header("if-modified-since"), modified) {
+        (Some(ims), Some(m)) => date_covers(ims, m),
+        _ => false,
     }
-    false
 }
 
 /// For a ranged request, decide whether the `If-Range` validator still matches
@@ -312,12 +321,7 @@ fn if_range_matches(req: &Request, etag: Option<&str>, modified: Option<SystemTi
     if ir.starts_with('"') {
         return etag == Some(ir);
     }
-    if let (Some(since), Some(m)) = (util::parse_http_date(ir), modified) {
-        if let Ok(mtime) = m.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64) {
-            return mtime <= since;
-        }
-    }
-    false
+    modified.is_some_and(|m| date_covers(ir, m))
 }
 
 /// The outcome of interpreting a `Range` header against a known content length.
@@ -408,39 +412,36 @@ struct IndexEntry {
     len: u64,
 }
 
-fn directory_index_html(
-    root: &Path,
-    decoded_path: &str,
-    fs_path: &Path,
-    exposes: &[String],
-) -> String {
+/// List `fs_path`'s children that aren't hidden (per `served.exposes`) and
+/// don't resolve outside `served.root` (an escaping symlink). Shared by the
+/// HTML index and PROPFIND, which otherwise duplicated this exact filter.
+fn visible_children(served: &Served, fs_path: &Path) -> Vec<fs::DirEntry> {
+    let Ok(rd) = fs::read_dir(fs_path) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter(|e| !util::is_hidden(&e.file_name().to_string_lossy(), served.exposes))
+        .filter(|e| within_root(served.root, &e.path()))
+        .collect()
+}
+
+fn directory_index_html(served: &Served, decoded_path: &str, fs_path: &Path) -> String {
     let mut entries: Vec<IndexEntry> = Vec::new();
-    if let Ok(rd) = fs::read_dir(fs_path) {
-        for e in rd.flatten() {
-            // Hidden system entries are omitted (they're also refused on access),
-            // unless re-exposed by an --expose glob.
-            if util::is_hidden(&e.file_name().to_string_lossy(), exposes) {
-                continue;
-            }
-            // Don't list entries (e.g. symlinks) that resolve outside the root.
-            if !within_root(root, &e.path()) {
-                continue;
-            }
-            // Follow symlinks so size/date match what GET would actually serve.
-            // Fall back to the entry's own type if the target can't be stat'd.
-            let md = fs::metadata(e.path()).ok();
-            let is_dir = md
-                .as_ref()
-                .map(|m| m.is_dir())
-                .or_else(|| e.file_type().map(|t| t.is_dir()).ok())
-                .unwrap_or(false);
-            entries.push(IndexEntry {
-                name: e.file_name().to_string_lossy().into_owned(),
-                is_dir,
-                modified: md.as_ref().and_then(|m| m.modified().ok()),
-                len: md.as_ref().map(|m| m.len()).unwrap_or(0),
-            });
-        }
+    for e in visible_children(served, fs_path) {
+        // Follow symlinks so size/date match what GET would actually serve.
+        // Fall back to the entry's own type if the target can't be stat'd.
+        let md = fs::metadata(e.path()).ok();
+        let is_dir = md
+            .as_ref()
+            .map(|m| m.is_dir())
+            .or_else(|| e.file_type().map(|t| t.is_dir()).ok())
+            .unwrap_or(false);
+        entries.push(IndexEntry {
+            name: e.file_name().to_string_lossy().into_owned(),
+            is_dir,
+            modified: md.as_ref().and_then(|m| m.modified().ok()),
+            len: md.as_ref().map(|m| m.len()).unwrap_or(0),
+        });
     }
     // Directories first, then alphabetical.
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
@@ -450,11 +451,11 @@ fn directory_index_html(
 
     let mut html = String::new();
     html.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
-    html.push_str(&format!("<title>Index of {}</title>", title));
+    let _ = write!(html, "<title>Index of {title}</title>");
     html.push_str(
         "<style>body{font-family:sans-serif}td,th{text-align:left;padding:0 1.5rem 0 0}</style></head><body>",
     );
-    html.push_str(&format!("<h1>Index of {}</h1>", title));
+    let _ = write!(html, "<h1>Index of {title}</h1>");
     html.push_str(
         "<table><thead><tr><th scope=\"col\">Name</th>\
          <th scope=\"col\">Last modified (UTC)</th>\
@@ -476,14 +477,11 @@ fn directory_index_html(
         } else {
             util::human_size(e.len)
         };
-        html.push_str(&format!(
-            "<tr><td><a href=\"{}\">{}{}</a></td><td>{}</td><td>{}</td></tr>",
-            href,
+        let _ = write!(
+            html,
+            "<tr><td><a href=\"{href}\">{}{suffix}</a></td><td>{modified}</td><td>{size}</td></tr>",
             util::xml_escape(&e.name),
-            suffix,
-            modified,
-            size,
-        ));
+        );
     }
     html.push_str("</tbody></table></body></html>");
     html
@@ -491,13 +489,12 @@ fn directory_index_html(
 
 fn propfind<S: Write>(
     stream: &mut S,
-    root: &Path,
+    served: &Served,
     decoded_path: &str,
     fs_path: &Path,
     req: &Request,
-    exposes: &[String],
 ) -> io::Result<()> {
-    let meta = match stat_within_root(stream, root, fs_path)? {
+    let meta = match stat_within_root(stream, served.root, fs_path)? {
         Some(m) => m,
         None => return Ok(()),
     };
@@ -512,7 +509,6 @@ fn propfind<S: Write>(
         return http::write_response(
             stream,
             403,
-            "Forbidden",
             "application/xml; charset=utf-8",
             &[],
             body.as_bytes(),
@@ -531,26 +527,15 @@ fn propfind<S: Write>(
     // Immediate children, if this is a collection and depth allows it.
     if meta.is_dir() && include_children {
         let base = util::with_trailing_slash(decoded_path);
-        if let Ok(rd) = fs::read_dir(fs_path) {
-            for entry in rd.flatten() {
-                let path = entry.path();
-                // Hidden system entries are omitted (and refused on direct
-                // access), unless re-exposed by an --expose glob.
-                if util::is_hidden(&entry.file_name().to_string_lossy(), exposes) {
-                    continue;
-                }
-                // Skip children that resolve outside the root (escaping symlinks).
-                if !within_root(root, &path) {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let child_path = format!("{}{}", base, name);
-                // Follow symlinks (matching GET); list un-stattable entries with
-                // a 404 propstat rather than dropping them from the listing.
-                match fs::metadata(&path) {
-                    Ok(child_meta) => xml.push_str(&response_xml(&child_path, &child_meta, &path)),
-                    Err(_) => xml.push_str(&response_failed_xml(&child_path)),
-                }
+        for entry in visible_children(served, fs_path) {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child_path = format!("{}{}", base, name);
+            // Follow symlinks (matching GET); list un-stattable entries with
+            // a 404 propstat rather than dropping them from the listing.
+            match fs::metadata(&path) {
+                Ok(child_meta) => xml.push_str(&response_xml(&child_path, &child_meta, &path)),
+                Err(_) => xml.push_str(&response_failed_xml(&child_path)),
             }
         }
     }
@@ -560,7 +545,6 @@ fn propfind<S: Write>(
     http::write_response(
         stream,
         207,
-        "Multi-Status",
         "application/xml; charset=utf-8",
         &[],
         xml.as_bytes(),
@@ -591,39 +575,28 @@ fn response_xml(href_path: &str, meta: &fs::Metadata, fs_path: &Path) -> String 
         .unwrap_or_else(|_| util::http_date(SystemTime::UNIX_EPOCH));
 
     let mut block = String::new();
-    block.push_str("  <D:response>\n");
-    block.push_str(&format!("    <D:href>{}</D:href>\n", href));
-    block.push_str("    <D:propstat>\n");
-    block.push_str("      <D:prop>\n");
-    block.push_str(&format!(
-        "        <D:displayname>{}</D:displayname>\n",
-        util::xml_escape(&display)
-    ));
-    block.push_str(&format!(
-        "        <D:getlastmodified>{}</D:getlastmodified>\n",
-        modified
-    ));
+    let _ = write!(
+        block,
+        "  <D:response>\n    <D:href>{href}</D:href>\n    <D:propstat>\n      <D:prop>\n        \
+         <D:displayname>{}</D:displayname>\n        <D:getlastmodified>{modified}</D:getlastmodified>\n",
+        util::xml_escape(&display),
+    );
     if is_dir {
         block.push_str("        <D:resourcetype><D:collection/></D:resourcetype>\n");
     } else {
-        block.push_str("        <D:resourcetype/>\n");
-        block.push_str(&format!(
-            "        <D:getcontentlength>{}</D:getcontentlength>\n",
-            meta.len()
-        ));
-        block.push_str(&format!(
-            "        <D:getcontenttype>{}</D:getcontenttype>\n",
-            util::mime_for(fs_path)
-        ));
+        let _ = write!(
+            block,
+            "        <D:resourcetype/>\n        <D:getcontentlength>{}</D:getcontentlength>\n        \
+             <D:getcontenttype>{}</D:getcontenttype>\n",
+            meta.len(),
+            util::mime_for(fs_path),
+        );
         // Same strong validator GET sends as ETag; the value has no XML specials.
         if let Some(etag) = etag_for(meta) {
-            block.push_str(&format!("        <D:getetag>{}</D:getetag>\n", etag));
+            let _ = writeln!(block, "        <D:getetag>{etag}</D:getetag>");
         }
     }
-    block.push_str("      </D:prop>\n");
-    block.push_str("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-    block.push_str("    </D:propstat>\n");
-    block.push_str("  </D:response>\n");
+    block.push_str("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n  </D:response>\n");
     block
 }
 

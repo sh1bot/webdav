@@ -1,6 +1,8 @@
 //! Small self-contained helpers: percent-coding, HTTP dates, MIME guessing,
 //! XML escaping and safe path resolution. Kept dependency-free on purpose.
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,10 +15,10 @@ pub fn percent_decode(input: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                let h = hex_val(bytes[i + 1]);
-                let l = hex_val(bytes[i + 2]);
+                let h = (bytes[i + 1] as char).to_digit(16);
+                let l = (bytes[i + 2] as char).to_digit(16);
                 if let (Some(h), Some(l)) = (h, l) {
-                    out.push((h << 4) | l);
+                    out.push(((h << 4) | l) as u8);
                     i += 3;
                     continue;
                 }
@@ -29,7 +31,9 @@ pub fn percent_decode(input: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    // The overwhelmingly common case is valid UTF-8, where this is a move with
+    // no copy; only a malformed sequence pays for the lossy-replacement path.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Percent-encode a path for use inside a WebDAV `<D:href>`. We keep the path
@@ -43,28 +47,10 @@ pub fn percent_encode_path(input: &str) -> String {
         if keep {
             out.push(b as char);
         } else {
-            out.push('%');
-            out.push(hex_digit(b >> 4));
-            out.push(hex_digit(b & 0x0f));
+            let _ = write!(out, "%{:02x}", b);
         }
     }
     out
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_digit(n: u8) -> char {
-    match n {
-        0..=9 => (b'0' + n) as char,
-        _ => (b'a' + (n - 10)) as char,
-    }
 }
 
 /// Escape text for safe inclusion in XML element content / attributes.
@@ -170,12 +156,15 @@ pub fn with_trailing_slash(path: &str) -> String {
 
 /// Very small extension -> MIME type table. Falls back to octet-stream.
 pub fn mime_for(path: &Path) -> &'static str {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    // Extensions are already lowercase in the overwhelming common case; only
+    // allocate a folded copy when one actually needs it.
+    let ext: Cow<str> = if ext.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(ext.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(ext)
+    };
+    match ext.as_ref() {
         "html" | "htm" => "text/html; charset=utf-8",
         "txt" | "text" | "md" => "text/plain; charset=utf-8",
         "css" => "text/css; charset=utf-8",

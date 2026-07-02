@@ -7,13 +7,32 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::time::SystemTime;
 
 use crate::util;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024; // PROPFIND bodies are tiny.
+
+/// The standard reason phrase for a status code this server emits. Centralized
+/// so every caller passes just the number — a status/phrase mismatch can't
+/// happen, and callers no longer repeat the phrase at every call site.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        206 => "Partial Content",
+        207 => "Multi-Status",
+        304 => "Not Modified",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        416 => "Range Not Satisfiable",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    }
+}
 
 thread_local! {
     /// Whether the response now being written should keep the connection open.
@@ -146,17 +165,12 @@ pub fn read_request<S: BufRead>(stream: &mut S) -> io::Result<Request> {
     } else if let Some(cl) = headers.get("content-length") {
         match cl.parse::<usize>() {
             Ok(len) if len <= MAX_BODY_BYTES => {
-                let mut remaining = len;
-                let mut sink = [0u8; 4096];
-                while remaining > 0 {
-                    let want = remaining.min(sink.len());
-                    let n = stream.read(&mut sink[..want])?;
-                    if n == 0 {
-                        well_framed = false; // truncated body
-                        break;
-                    }
-                    remaining -= n;
-                }
+                // Fully-qualified: `S` and `&mut S` both implement `Read`, and plain
+                // method-call syntax resolves the ambiguity onto `S` (attempting to
+                // move `*stream`); spelling out `Self = &mut S` keeps it a reborrow.
+                let mut limited = <&mut S as Read>::take(stream, len as u64);
+                let copied = io::copy(&mut limited, &mut io::sink())?;
+                well_framed = copied == len as u64; // short copy means a truncated body
             }
             _ => well_framed = false, // oversized or unparseable
         }
@@ -177,7 +191,6 @@ pub fn read_request<S: BufRead>(stream: &mut S) -> io::Result<Request> {
 pub fn write_response<S: Write>(
     stream: &mut S,
     status: u16,
-    reason: &str,
     content_type: &str,
     extra_headers: &[(&str, String)],
     body: &[u8],
@@ -186,7 +199,6 @@ pub fn write_response<S: Write>(
     write_head(
         stream,
         status,
-        reason,
         content_type,
         extra_headers,
         body.len() as u64,
@@ -204,14 +216,13 @@ pub fn write_response<S: Write>(
 pub fn write_head<S: Write>(
     stream: &mut S,
     status: u16,
-    reason: &str,
     content_type: &str,
     extra_headers: &[(&str, String)],
     content_length: u64,
 ) -> io::Result<()> {
     LAST_STATUS.with(|s| s.set(status));
     let mut head = String::new();
-    let _ = write!(head, "HTTP/1.1 {} {}\r\n", status, reason);
+    let _ = write!(head, "HTTP/1.1 {} {}\r\n", status, reason_phrase(status));
     let _ = write!(head, "Content-Length: {}\r\n", content_length);
     if !content_type.is_empty() {
         let _ = write!(head, "Content-Type: {}\r\n", content_type);
@@ -278,12 +289,11 @@ pub fn send_file(
 }
 
 /// Convenience for short text/error responses.
-pub fn write_status<S: Write>(stream: &mut S, status: u16, reason: &str) -> io::Result<()> {
-    let body = format!("{} {}\n", status, reason);
+pub fn write_status<S: Write>(stream: &mut S, status: u16) -> io::Result<()> {
+    let body = format!("{} {}\n", status, reason_phrase(status));
     write_response(
         stream,
         status,
-        reason,
         "text/plain; charset=utf-8",
         &[],
         body.as_bytes(),

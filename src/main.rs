@@ -39,36 +39,40 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "tiny-webdav — read-only WebDAV over plaintext HTTP, run behind stunnel\n\n\
-         USAGE:\n  \
-           tiny-webdav [--root <dir>] [options]\n\n\
-         OPTIONS:\n  \
-           --root <dir>            Directory to serve (default: current directory)\n  \
-           --listen <addr>         Listen on addr (e.g. 127.0.0.1:8080) and fork a\n                          \
-                       child per connection. No TLS. Default: serve one\n                          \
-                       connection from stdin (the inetd/stunnel contract).\n  \
-           --run-as <user>         When started as root, chroot into --root and\n                          \
-                       drop to this user (default: nobody)\n  \
-           --timeout <secs>        Per-read/write socket timeout, also bounding an\n                          \
-                       idle keep-alive connection (default: 30, 0 = none)\n  \
-           --max-requests <n>      Max requests per persistent connection\n                          \
-                       (default: 100, 0 = unlimited)\n  \
-           -v, --verbose           Log one line per request: method, path, status,\n                          \
-                       and any conditional/range headers (If-Modified-Since,\n                          \
-                       If-None-Match, If-Range, Range, Depth)\n  \
-           --expose <glob>         Re-expose an otherwise-hidden name (repeatable).\n                          \
-                       Names beginning with . @ $ (dotfiles, @eaDir,\n                          \
-                       $RECYCLE.BIN, …) are hidden AND refused (404).\n                          \
-                       Globs use * and ?, matched per name: e.g.\n                          \
-                       --expose .mpdignore, or --expose '*' for all.\n  \
-           --log-file <file>       Write diagnostics to this file. Default: stderr\n                          \
-                       (captured by stunnel/systemd). Use this under xinetd,\n                          \
-                       where stderr is the client socket.\n\n  \
-           HTTP Basic auth (client certs are handled by stunnel, not here):\n  \
-           --auth-file <file>      File of 'username:password' lines (# comments)\n  \
-           --user <name>           A single username (use with --password)\n  \
-           --password <pass>       Password for --user\n  \
-           --realm <realm>         Basic-auth realm shown to clients (default: tiny-webdav)\n"
+        "tiny-webdav — read-only WebDAV over plaintext HTTP, run behind stunnel
+
+USAGE:
+  tiny-webdav [--root <dir>] [options]
+
+OPTIONS:
+  --root <dir>            Directory to serve (default: current directory)
+  --listen <addr>         Listen on addr (e.g. 127.0.0.1:8080) and fork a
+                          child per connection. No TLS. Default: serve one
+                          connection from stdin (the inetd/stunnel contract).
+  --run-as <user>         When started as root, chroot into --root and
+                          drop to this user (default: nobody)
+  --timeout <secs>        Per-read/write socket timeout, also bounding an
+                          idle keep-alive connection (default: 30, 0 = none)
+  --max-requests <n>      Max requests per persistent connection
+                          (default: 100, 0 = unlimited)
+  -v, --verbose           Log one line per request: method, path, status,
+                          and any conditional/range headers (If-Modified-Since,
+                          If-None-Match, If-Range, Range, Depth)
+  --expose <glob>         Re-expose an otherwise-hidden name (repeatable).
+                          Names beginning with . @ $ (dotfiles, @eaDir,
+                          $RECYCLE.BIN, …) are hidden AND refused (404).
+                          Globs use * and ?, matched per name: e.g.
+                          --expose .mpdignore, or --expose '*' for all.
+  --log-file <file>       Write diagnostics to this file. Default: stderr
+                          (captured by stunnel/systemd). Use this under xinetd,
+                          where stderr is the client socket.
+
+  HTTP Basic auth (client certs are handled by stunnel, not here):
+  --auth-file <file>      File of 'username:password' lines (# comments)
+  --user <name>           A single username (use with --password)
+  --password <pass>       Password for --user
+  --realm <realm>         Basic-auth realm shown to clients (default: tiny-webdav)
+"
     );
     process::exit(2);
 }
@@ -147,20 +151,25 @@ fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
     Ok(auth)
 }
 
+/// Everything the serve loop needs, gathered once in `main` and passed by
+/// reference so `serve_stdin`/`serve_listener` don't thread six individually
+/// growing parameters (this bundle grew one field per feature added).
+struct ServeConfig<'a> {
+    root: &'a Path,
+    auth: &'a Auth,
+    timeout: u64,
+    max_requests: u32,
+    verbose: bool,
+    exposes: &'a [String],
+}
+
 /// Serve the connection stunnel/inetd handed us. Per the inetd contract we read
 /// requests from stdin (fd 0), write replies to stdout (fd 1), and log to stderr
 /// (fd 2) — without assuming any of them is a socket. The connection is reused
 /// for successive requests (HTTP keep-alive) until the client closes it, asks to
 /// close, an error/timeout occurs, or `--max-requests` is reached.
 #[cfg(unix)]
-fn serve_stdin(
-    root: &Path,
-    auth: &Auth,
-    timeout: u64,
-    max_requests: u32,
-    verbose: bool,
-    exposes: &[String],
-) {
+fn serve_stdin(cfg: &ServeConfig) {
     use std::io::BufReader;
     use std::os::unix::io::FromRawFd;
 
@@ -171,9 +180,14 @@ fn serve_stdin(
 
     // Bound how long a single read/write — including the wait for the next
     // keep-alive request — may block. Best-effort: ignored on non-sockets.
-    if timeout != 0 {
-        set_socket_timeouts(timeout);
+    if cfg.timeout != 0 {
+        set_socket_timeouts(cfg.timeout);
     }
+
+    let served_root = dav::Served {
+        root: cfg.root,
+        exposes: cfg.exposes,
+    };
 
     // BufReader gives us cheap byte-at-a-time header parsing (one syscall per
     // bufferful) and holds any bytes already read past one request for the next.
@@ -182,12 +196,12 @@ fn serve_stdin(
     // EOF, a read timeout, or a malformed line ends the connection.
     while let Ok(req) = http::read_request(&mut reader) {
         served += 1;
-        let keep = req.keep_alive() && (max_requests == 0 || served < max_requests);
+        let keep = req.keep_alive() && (cfg.max_requests == 0 || served < cfg.max_requests);
         http::set_keep_alive(keep);
 
         let result =
-            dav::handle(&mut output, root, auth, &req, exposes).and_then(|()| output.flush());
-        if verbose {
+            dav::handle(&mut output, &served_root, cfg.auth, &req).and_then(|()| output.flush());
+        if cfg.verbose {
             log_request(&req, http::last_status());
         }
         if let Err(e) = result {
@@ -201,14 +215,7 @@ fn serve_stdin(
 }
 
 #[cfg(not(unix))]
-fn serve_stdin(
-    _root: &Path,
-    _auth: &Auth,
-    _timeout: u64,
-    _max_requests: u32,
-    _verbose: bool,
-    _exposes: &[String],
-) {
+fn serve_stdin(_cfg: &ServeConfig) {
     eprintln!("error: tiny-webdav is only supported on Unix platforms");
     process::exit(1);
 }
@@ -218,6 +225,7 @@ fn serve_stdin(
 /// or cached-copy request (so a `304`/`206` shows the client was spared a
 /// re-fetch, while a plain `200` for data it already holds stands out).
 fn log_request(req: &http::Request, status: u16) {
+    use std::fmt::Write as _;
     let mut line = format!("{} {} {} -> {}", req.method, req.path, req.version, status);
     for name in [
         "if-modified-since",
@@ -227,7 +235,7 @@ fn log_request(req: &http::Request, status: u16) {
         "depth",
     ] {
         if let Some(v) = req.header(name) {
-            line.push_str(&format!(" {}={:?}", name, v));
+            let _ = write!(line, " {}={:?}", name, v);
         }
     }
     eprintln!("{}", line);
@@ -315,15 +323,7 @@ fn bind_listener(addr: &str) -> io::Result<std::net::TcpListener> {
 /// copy-on-write, with no `exec`. The child moves the connection onto fd 0/1 and
 /// runs the very same serve loop as the inetd path.
 #[cfg(unix)]
-fn serve_listener(
-    listener: std::net::TcpListener,
-    root: &Path,
-    auth: &Auth,
-    timeout: u64,
-    max_requests: u32,
-    verbose: bool,
-    exposes: &[String],
-) -> ! {
+fn serve_listener(listener: std::net::TcpListener, cfg: &ServeConfig) -> ! {
     use std::os::unix::io::{AsRawFd, IntoRawFd};
 
     // Reap children automatically: with SIGCHLD ignored the kernel discards each
@@ -363,7 +363,7 @@ fn serve_listener(
                     libc::close(listen_fd);
                 }
                 deny_rlimit(libc::RLIMIT_NPROC as _);
-                serve_stdin(root, auth, timeout, max_requests, verbose, exposes);
+                serve_stdin(cfg);
                 process::exit(0);
             }
             _ => { /* Parent: fall through to drop the connection. */ }
@@ -373,15 +373,7 @@ fn serve_listener(
 }
 
 #[cfg(not(unix))]
-fn serve_listener(
-    _listener: std::net::TcpListener,
-    _root: &Path,
-    _auth: &Auth,
-    _timeout: u64,
-    _max_requests: u32,
-    _verbose: bool,
-    _exposes: &[String],
-) -> ! {
+fn serve_listener(_listener: std::net::TcpListener, _cfg: &ServeConfig) -> ! {
     eprintln!("error: --listen is only supported on Unix platforms");
     process::exit(1);
 }
@@ -412,36 +404,32 @@ fn main() {
     // --log-file is required there to keep diagnostics off the wire. We never
     // touch fd 0 (request) or fd 1 (reply).
     if let Some(path) = &args.log_file {
-        match std::fs::OpenOptions::new()
+        // Fail fast on a bad log path rather than risk writing diagnostics to
+        // the connection (the inherited stderr under xinetd).
+        let f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-        {
-            Ok(f) => unsafe {
-                libc::dup2(f.as_raw_fd(), 2);
-            },
-            // Fail fast on a bad log path rather than risk writing diagnostics to
-            // the connection (the inherited stderr under xinetd).
-            Err(e) => {
-                eprintln!("error: cannot open --log-file {}: {}", path.display(), e);
-                process::exit(1);
-            }
+            .unwrap_or_else(|e| {
+                fatal(&format!("cannot open --log-file {}: {}", path.display(), e))
+            });
+        unsafe {
+            libc::dup2(f.as_raw_fd(), 2);
         }
     }
 
-    let canonical_root = match args.root.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: cannot access --root {}: {}", args.root.display(), e);
-            process::exit(1);
-        }
-    };
+    let canonical_root = args.root.canonicalize().unwrap_or_else(|e| {
+        fatal(&format!(
+            "cannot access --root {}: {}",
+            args.root.display(),
+            e
+        ))
+    });
     if !canonical_root.is_dir() {
-        eprintln!(
-            "error: --root {} is not a directory",
+        fatal(&format!(
+            "--root {} is not a directory",
             canonical_root.display()
-        );
-        process::exit(1);
+        ));
     }
 
     // Open --auth-file now, before the chroot/drop, while its path is reachable
@@ -462,16 +450,9 @@ fn main() {
     // In --listen mode, bind the socket *before* dropping privileges, so a
     // privileged port (< 1024) can still be claimed while we're root. The bound
     // socket survives the chroot untouched.
-    let listener = match &args.listen {
-        Some(addr) => match bind_listener(addr) {
-            Ok(l) => Some(l),
-            Err(e) => {
-                eprintln!("error: cannot listen on {}: {}", addr, e);
-                process::exit(1);
-            }
-        },
-        None => None,
-    };
+    let listener = args.listen.as_ref().map(|addr| {
+        bind_listener(addr).unwrap_or_else(|e| fatal(&format!("cannot listen on {}: {}", addr, e)))
+    });
 
     // Everything taken from the command line is now open: --log-file is dup'd onto
     // fd 2 and --auth-file holds an fd, both before the chroot (the served files
@@ -483,13 +464,8 @@ fn main() {
     let serve_root = lower_privileges(&canonical_root, args.run_as.as_deref(), listener.is_some());
 
     // Now unprivileged: parse the (already-open) auth file and inline credentials.
-    let auth = match build_auth(&args, auth_file) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: cannot load credentials: {}", e);
-            process::exit(1);
-        }
-    };
+    let auth = build_auth(&args, auth_file)
+        .unwrap_or_else(|e| fatal(&format!("cannot load credentials: {}", e)));
 
     // Warn when nothing authenticates the client. In --listen mode there's no TLS
     // and thus never a client certificate, so only Basic auth counts. Behind
@@ -508,24 +484,17 @@ fn main() {
         }
     }
 
+    let cfg = ServeConfig {
+        root: &serve_root,
+        auth: &auth,
+        timeout: args.timeout,
+        max_requests: args.max_requests,
+        verbose: args.verbose,
+        exposes: &args.exposes,
+    };
     match listener {
-        Some(l) => serve_listener(
-            l,
-            &serve_root,
-            &auth,
-            args.timeout,
-            args.max_requests,
-            args.verbose,
-            &args.exposes,
-        ),
-        None => serve_stdin(
-            &serve_root,
-            &auth,
-            args.timeout,
-            args.max_requests,
-            args.verbose,
-            &args.exposes,
-        ),
+        Some(l) => serve_listener(l, &cfg),
+        None => serve_stdin(&cfg),
     }
 }
 

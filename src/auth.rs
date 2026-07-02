@@ -68,36 +68,27 @@ impl Auth {
     /// Returns true if the request is permitted. When auth is disabled this is
     /// always true; otherwise the request must present a valid Basic credential.
     pub fn authorize(&self, req: &Request) -> bool {
-        if !self.is_enabled() {
-            return true;
-        }
-        let header = match req.header("authorization") {
-            Some(h) => h,
-            None => return false,
-        };
+        !self.is_enabled() || self.check_credential(req).unwrap_or(false)
+    }
+
+    /// Extract and verify a Basic credential from the request. `None` means the
+    /// header was missing or malformed in some way (wrong scheme, bad base64,
+    /// not UTF-8, no colon); the caller treats that the same as "wrong password".
+    fn check_credential(&self, req: &Request) -> Option<bool> {
+        let header = req.header("authorization")?;
         // The auth scheme is case-insensitive (RFC 7617).
-        let encoded = match header.split_once(' ') {
-            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("Basic") => rest.trim(),
-            _ => return false,
-        };
-        let decoded = match base64_decode(encoded) {
-            Some(d) => d,
-            None => return false,
-        };
-        let decoded = match String::from_utf8(decoded) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
+        let (scheme, rest) = header.split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("Basic") {
+            return None;
+        }
+        let decoded = String::from_utf8(base64_decode(rest.trim())?).ok()?;
         // Only split on the *first* colon: passwords may contain colons.
-        let (user, pass) = match decoded.split_once(':') {
-            Some(p) => p,
-            None => return false,
-        };
+        let (user, pass) = decoded.split_once(':')?;
         // `password_matches` does the same length-governed work whether or not
         // the account exists, so a wrong password, a length mismatch, and an
         // unknown user are not distinguishable by timing.
         let stored = self.creds.get(user).map(String::as_bytes);
-        password_matches(stored, pass.as_bytes())
+        Some(password_matches(stored, pass.as_bytes()))
     }
 
     /// Send a `401 Unauthorized` challenge prompting for Basic credentials.
@@ -105,7 +96,6 @@ impl Auth {
         http::write_response(
             stream,
             401,
-            "Unauthorized",
             "text/plain; charset=utf-8",
             &[(
                 "WWW-Authenticate",
@@ -139,6 +129,34 @@ fn password_matches(stored: Option<&[u8]>, candidate: &[u8]) -> bool {
     diff == 0 && stored.is_some()
 }
 
+/// Minimal standard-alphabet base64 decoder. Tolerates missing `=` padding and
+/// embedded whitespace. Returns `None` on any invalid character.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for &c in input.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::password_matches as pm;
@@ -167,32 +185,4 @@ mod tests {
         assert!(pm(Some(b""), b""));
         assert!(!pm(Some(b""), b"x"));
     }
-}
-
-/// Minimal standard-alphabet base64 decoder. Tolerates missing `=` padding and
-/// embedded whitespace. Returns `None` on any invalid character.
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    for &c in input.as_bytes() {
-        if c == b'=' || c.is_ascii_whitespace() {
-            continue;
-        }
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        } as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
 }
