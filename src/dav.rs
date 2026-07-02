@@ -242,7 +242,12 @@ fn stat_within_root<S: Write>(
 /// traversal and out-of-root paths.
 fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
     let status = match e.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => 404,
+        // NotFound and PermissionDenied both 404 (reveal nothing). InvalidInput
+        // is what a path with an interior NUL (`%00`) becomes at the CString
+        // boundary — it can't name a real file, so 404 it too rather than 500.
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => {
+            404
+        }
         _ => 500,
     };
     http::write_status(stream, status)

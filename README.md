@@ -110,6 +110,7 @@ stderr (the systemd journal) — fine here.
 |---|---|---|
 | `--root` | Directory to serve (read-only) | current dir |
 | `--listen` | Listen on `addr` (e.g. `127.0.0.1:8080`) and fork per connection; no TLS. Omit to serve one connection from stdin | *(stdin)* |
+| `--max-connections` | With `--listen`, cap concurrent connections (excess wait in the backlog); `0` = unlimited | `64` |
 | `--run-as` | User to chroot+drop to when started as root (must exist) | `nobody` |
 | `--log-file` | Write diagnostics here instead of stderr (required under xinetd) | *(stderr)* |
 | `--auth-file` | File of `username:password` lines (`#` comments; password may contain `:`) | *(none)* |
@@ -212,10 +213,12 @@ unprivileged uid, and re-forbids forking for itself. Forking the already-running
 image is copy-on-write, with no `exec`. Started unprivileged (non-root, port
 `≥ 1024`) it simply serves as the current user.
 
-Children are reaped automatically (`SIGCHLD` ignored), so no zombies accumulate.
-The socket is bound with `SO_REUSEADDR`, so a restart isn't refused while a
-just-closed connection lingers in `TIME_WAIT`. Concurrency isn't capped — put it
-behind a proxy or a firewall if you need connection limits.
+Concurrency is bounded by `--max-connections` (default 64): the accept loop
+serves at most that many connections at once and lets the rest wait in the
+kernel backlog, so a connection flood can't fork children without limit. Exited
+children are reaped by the loop itself (no zombie buildup). The socket is bound
+with `SO_REUSEADDR`, so a restart isn't refused while a just-closed connection
+lingers in `TIME_WAIT`.
 
 ## Connect
 
@@ -260,11 +263,11 @@ zeroes it for itself — the process actually serving a client still can't fork.
 - **TLS, ciphers, and client-cert verification are stunnel's job** — keep it
   patched; tiny-webdav contains no TLS code. `--listen` mode has **no TLS at all**,
   so only use it on a trusted network or behind a separate TLS terminator.
-- Concurrency and connection caps are the front's job — stunnel (`per_source`,
-  `TIMEOUTidle`/`TIMEOUTbusy`) or, in `--listen` mode, a proxy/firewall, since the
-  accept loop forks without a cap. tiny-webdav adds only a best-effort per-socket
-  read/write `--timeout` so an idle kept-alive connection can't pin its process
-  forever; a hung connection still only ties up its own process.
+- Behind stunnel/xinetd, concurrency and connection rate are the supervisor's
+  job (`per_source`, `TIMEOUTidle`/`TIMEOUTbusy`, `instances`). In `--listen`
+  mode tiny-webdav caps concurrency itself with `--max-connections` (default 64),
+  and a best-effort per-socket read/write `--timeout` keeps an idle kept-alive
+  connection from pinning its process; a hung connection only ties up its own.
 - "Read-only" means no request can modify the served tree; the process only ever
   writes the operator's `--log-file`.
 - Example certs from `gen-certs.sh` are for testing only; use your own PKI in

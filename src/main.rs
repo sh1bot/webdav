@@ -32,6 +32,7 @@ struct Args {
     timeout: u64,
     max_requests: u32,
     listen: Option<String>,
+    max_connections: u32,
     verbose: bool,
     exposes: Vec<String>,
 }
@@ -48,6 +49,8 @@ OPTIONS:
   --listen <addr>         Listen on addr (e.g. 127.0.0.1:8080) and fork a
                           child per connection. No TLS. Default: serve one
                           connection from stdin (the inetd/stunnel contract).
+  --max-connections <n>   With --listen, cap concurrent connections; excess
+                          wait in the backlog (default: 64, 0 = unlimited)
   --run-as <user>         When started as root, chroot into --root and
                           drop to this user (default: nobody)
   --timeout <secs>        Per-read/write socket timeout, also bounding an
@@ -86,6 +89,7 @@ fn parse_args() -> Args {
     let mut timeout: u64 = 30;
     let mut max_requests: u32 = 100;
     let mut listen: Option<String> = None;
+    let mut max_connections: u32 = 64;
     let mut verbose = false;
     let mut exposes: Vec<String> = Vec::new();
 
@@ -95,6 +99,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--root" => root = PathBuf::from(val()),
             "--listen" => listen = Some(val()),
+            "--max-connections" => max_connections = val().parse().unwrap_or_else(|_| usage()),
             "-v" | "--verbose" => verbose = true,
             "--expose" => exposes.push(val()),
             "--auth-file" => auth_file = Some(PathBuf::from(val())),
@@ -122,6 +127,7 @@ fn parse_args() -> Args {
         timeout,
         max_requests,
         listen,
+        max_connections,
         verbose,
         exposes,
     }
@@ -152,6 +158,7 @@ struct ServeConfig<'a> {
     auth: &'a Auth,
     timeout: u64,
     max_requests: u32,
+    max_connections: u32,
     verbose: bool,
     exposes: &'a [String],
 }
@@ -219,7 +226,12 @@ fn serve_stdin(_cfg: &ServeConfig) {
 /// re-fetch, while a plain `200` for data it already holds stands out).
 fn log_request(req: &http::Request, status: u16) {
     use std::fmt::Write as _;
-    let mut line = format!("{} {} {} -> {}", req.method, req.path, req.version, status);
+    // Quote the client-supplied tokens ({:?}) so a crafted method/path/version
+    // can't inject control bytes (e.g. ESC/CR) into the log stream.
+    let mut line = format!(
+        "{:?} {:?} {:?} -> {}",
+        req.method, req.path, req.version, status
+    );
     for name in [
         "if-modified-since",
         "if-none-match",
@@ -319,13 +331,26 @@ fn bind_listener(addr: &str) -> io::Result<std::net::TcpListener> {
 fn serve_listener(listener: std::net::TcpListener, cfg: &ServeConfig) -> ! {
     use std::os::unix::io::{AsRawFd, IntoRawFd};
 
-    // Reap children automatically: with SIGCHLD ignored the kernel discards each
-    // child's exit status instead of leaving a zombie, so the accept loop needs
-    // no wait() bookkeeping.
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
-
+    // We reap children ourselves (no `SIGCHLD` = `SIG_IGN`) so we can count how
+    // many are in flight and cap concurrency: otherwise a connection flood forks
+    // children without bound and exhausts PIDs/memory. Exited children stay
+    // reapable (as zombies) until `reap_dead` collects them each loop.
     let listen_fd = listener.as_raw_fd();
+    let mut live: u32 = 0; // connections currently being served by a child
     loop {
+        live = live.saturating_sub(reap_dead());
+
+        // Enforce --max-connections: if every slot is taken, block until a child
+        // exits before accepting more (excess connections queue in the kernel
+        // backlog, then are refused by the OS). A cap of 0 disables the limit.
+        while cfg.max_connections != 0 && live >= cfg.max_connections {
+            if unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0 {
+                live -= 1;
+            } else {
+                live = 0; // no child left to wait on: our count was stale
+            }
+        }
+
         let stream = match listener.accept() {
             Ok((s, _addr)) => s,
             Err(e) => {
@@ -359,10 +384,21 @@ fn serve_listener(listener: std::net::TcpListener, cfg: &ServeConfig) -> ! {
                 serve_stdin(cfg);
                 process::exit(0);
             }
-            _ => { /* Parent: fall through to drop the connection. */ }
+            _ => live += 1, // Parent: one more child in flight.
         }
         drop(stream); // Parent's copy of the connection; the child owns its own.
     }
+}
+
+/// Reap all children that have already exited (non-blocking), returning the
+/// count so the accept loop can free their concurrency slots.
+#[cfg(unix)]
+fn reap_dead() -> u32 {
+    let mut n = 0;
+    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {
+        n += 1;
+    }
+    n
 }
 
 #[cfg(not(unix))]
@@ -480,6 +516,7 @@ fn main() {
         auth: &auth,
         timeout: args.timeout,
         max_requests: args.max_requests,
+        max_connections: args.max_connections,
         verbose: args.verbose,
         exposes: &args.exposes,
     };
