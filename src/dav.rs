@@ -16,8 +16,8 @@ use crate::util;
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND";
 
 /// The static, per-server configuration every handler needs: the served root
-/// (for the symlink-escape check) and the `--expose` overrides (for the hidden-
-/// file gate). Bundled since the two always travel together.
+/// (for the symlink-escape check) and the `--expose` overrides (for the
+/// hidden-file gate).
 pub struct Served<'a> {
     pub root: &'a Path,
     pub exposes: &'a [String],
@@ -229,11 +229,10 @@ fn stat_within_root<S: Write>(
     Ok(Some(meta))
 }
 
-/// Map a filesystem error to the appropriate HTTP status response. A
-/// permission-denied target is reported as `404`, not `403`, so the response
-/// never reveals that an inaccessible path (e.g. a symlink to a chmod-000 or
-/// out-of-root target) exists — matching the reveal-nothing `404` used for
-/// traversal and out-of-root paths.
+/// Map a filesystem error to an HTTP status. Permission-denied is reported as
+/// `404`, not `403`, so the response never reveals that an inaccessible path
+/// exists — matching the reveal-nothing `404` used for traversal and out-of-root
+/// paths.
 fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
     let status = match e.kind() {
         // NotFound and PermissionDenied both 404 (reveal nothing). InvalidInput

@@ -138,8 +138,8 @@ fn parse_args() -> Args {
 /// the bug-prone work runs unprivileged. The path string is only for error text.
 fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
     let mut auth = Auth::new();
-    // The open file and its path are always Some together (both come from
-    // `args.auth_file`), so pair them and use the path only for error labels.
+    // Both come from `args.auth_file`, so they're Some together; the path is
+    // only for error labels.
     if let (Some(file), Some(path)) = (auth_file, &args.auth_file) {
         auth.load(file, &path.display().to_string())?;
     }
@@ -151,9 +151,8 @@ fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
     Ok(auth)
 }
 
-/// Everything the serve loop needs, gathered once in `main` and passed by
-/// reference so `serve_stdin`/`serve_listener` don't take a long list of
-/// individual parameters.
+/// Everything the serve loop needs, bundled so `serve_stdin`/`serve_listener`
+/// take one reference instead of a long parameter list.
 struct ServeConfig<'a> {
     root: &'a Path,
     auth: &'a Auth,
@@ -222,9 +221,8 @@ fn serve_stdin(_cfg: &ServeConfig) {
 }
 
 /// One-line request log for `--verbose`: method, path, response status, and any
-/// conditional/range headers — the fields that reveal a "changes since <date>"
-/// or cached-copy request (so a `304`/`206` shows the client was spared a
-/// re-fetch, while a plain `200` for data it already holds stands out).
+/// conditional/range headers — enough to see whether a cached-copy or "changes
+/// since <date>" request was spared a re-fetch (304/206) or not (200).
 fn log_request(req: &http::Request, status: u16) {
     use std::fmt::Write as _;
     // Quote the client-supplied tokens ({:?}) so a crafted method/path/version

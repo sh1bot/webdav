@@ -35,9 +35,9 @@ fn reason_phrase(status: u16) -> &'static str {
 }
 
 thread_local! {
-    /// Whether the response now being written should keep the connection open.
-    /// Set once per request by the serve loop and read by `write_head`. The
-    /// process is single-threaded and handles one connection, so this is a
+    /// Whether the response now being written should keep the connection open;
+    /// set per request by the serve loop, read by `write_head`. One
+    /// single-threaded process per connection, so a thread-local acts as a
     /// per-connection flag without threading it through every response helper.
     static KEEP_ALIVE: Cell<bool> = const { Cell::new(false) };
 }
@@ -99,11 +99,10 @@ impl Request {
 /// announced via `Content-Length` (we don't need the body content, but we
 /// must consume it to keep the stream sane before replying).
 pub fn read_request<S: BufRead>(stream: &mut S) -> io::Result<Request> {
-    // Read the header block a line at a time until the blank line that ends it.
-    // `read_until` pulls a whole line straight from the buffer, rather than one
-    // trait call per byte — but it has no length cap of its own, so bound each
-    // read to the remaining header budget. Otherwise a client streaming bytes
-    // with no `\n` would grow `buf` without limit (OOM) before any size check.
+    // Read the header block one line at a time until the terminating blank line.
+    // `read_until` has no length cap, so bound each read to the remaining header
+    // budget; otherwise a client streaming bytes with no `\n` grows `buf`
+    // unboundedly (OOM) before any size check.
     let mut buf = Vec::with_capacity(1024);
     loop {
         let budget = MAX_HEADER_BYTES.saturating_sub(buf.len());

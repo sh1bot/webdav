@@ -8,10 +8,10 @@
 //! disabled. When enabled, every request must carry valid `Authorization: Basic`
 //! credentials.
 //!
-//! Basic auth sends the password in (base64 of) cleartext, which is safe only
-//! because a TLS-terminating front (stunnel, cloudflared, a reverse proxy) has
-//! already encrypted the connection to the client — tiny-webdav is never
-//! exposed to the network directly.
+//! Basic auth sends the password in (base64 of) cleartext, so it is only as
+//! private as the transport: it assumes a TLS-terminating front (stunnel,
+//! cloudflared, a reverse proxy) encrypts the connection to the client and that
+//! tiny-webdav is not reachable on the network directly.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
