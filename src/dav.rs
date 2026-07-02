@@ -132,37 +132,31 @@ fn get_or_head<S: Write + AsRawFd>(
         _ => RangeSpec::Ignore,
     };
 
-    match spec {
-        // A range was requested and it is satisfiable: 206 Partial Content.
+    // Resolve the range to (status, offset, count); 416 is the one outcome that
+    // sends its own tiny body rather than streaming the file.
+    let (status, offset, count) = match spec {
         RangeSpec::Satisfiable { start, end } => {
-            let count = end - start + 1;
             headers.push(("Content-Range", format!("bytes {}-{}/{}", start, end, len)));
-            let resp = Resp {
-                status: 206,
-                content_type,
-                headers: &headers,
-            };
-            stream_file(stream, fs_path, start, count, &resp, send_body)
+            (206, start, end - start + 1)
         }
-        // A range was requested but cannot be satisfied: 416.
-        RangeSpec::Unsatisfiable => http::write_response(
-            stream,
-            416,
-            "text/plain; charset=utf-8",
-            &[("Content-Range", format!("bytes */{}", len))],
-            b"416 Range Not Satisfiable\n",
-            true,
-        ),
-        // No usable Range header: serve the whole file (200).
-        RangeSpec::Ignore => {
-            let resp = Resp {
-                status: 200,
-                content_type,
-                headers: &headers,
-            };
-            stream_file(stream, fs_path, 0, len, &resp, send_body)
+        RangeSpec::Ignore => (200, 0, len),
+        RangeSpec::Unsatisfiable => {
+            return http::write_response(
+                stream,
+                416,
+                "text/plain; charset=utf-8",
+                &[("Content-Range", format!("bytes */{}", len))],
+                b"416 Range Not Satisfiable\n",
+                true,
+            );
         }
-    }
+    };
+    let resp = Resp {
+        status,
+        content_type,
+        headers: &headers,
+    };
+    stream_file(stream, fs_path, offset, count, &resp, send_body)
 }
 
 /// Build the `Last-Modified`/`ETag` headers shared by the 304 and 200/206 paths.
@@ -292,16 +286,11 @@ fn etag_list_matches(header: &str, etag: &str) -> bool {
 /// date form of `If-Range`; both compare at one-second resolution (`as_secs`),
 /// matching what `Last-Modified` itself was rendered from.
 fn date_covers(header_val: &str, modified: SystemTime) -> bool {
-    let Some(since) = util::parse_http_date(header_val) else {
-        return false;
-    };
-    let Ok(mtime) = modified
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-    else {
-        return false;
-    };
-    mtime <= since
+    util::parse_http_date(header_val).is_some_and(|since| {
+        modified
+            .duration_since(UNIX_EPOCH)
+            .is_ok_and(|d| d.as_secs() as i64 <= since)
+    })
 }
 
 /// Evaluate conditional-GET preconditions. Returns true when the client's
@@ -309,20 +298,18 @@ fn date_covers(header_val: &str, modified: SystemTime) -> bool {
 /// `If-None-Match` takes precedence over `If-Modified-Since` (RFC 7232).
 fn not_modified(req: &Request, etag: Option<&str>, modified: Option<SystemTime>) -> bool {
     if let Some(inm) = req.header("if-none-match") {
-        return etag.map(|e| etag_list_matches(inm, e)).unwrap_or(false);
+        return etag.is_some_and(|e| etag_list_matches(inm, e));
     }
-    match (req.header("if-modified-since"), modified) {
-        (Some(ims), Some(m)) => date_covers(ims, m),
-        _ => false,
-    }
+    req.header("if-modified-since")
+        .zip(modified)
+        .is_some_and(|(ims, m)| date_covers(ims, m))
 }
 
 /// For a ranged request, decide whether the `If-Range` validator still matches
 /// (so the range is safe to serve). No `If-Range` header => always matches.
 fn if_range_matches(req: &Request, etag: Option<&str>, modified: Option<SystemTime>) -> bool {
-    let ir = match req.header("if-range") {
-        Some(v) => v.trim(),
-        None => return true,
+    let Some(ir) = req.header("if-range").map(str::trim) else {
+        return true;
     };
     if ir.starts_with('"') {
         return etag == Some(ir);

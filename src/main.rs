@@ -83,38 +83,40 @@ OPTIONS:
 }
 
 fn parse_args() -> Args {
-    let mut root = PathBuf::from(".");
-    let mut auth_file: Option<PathBuf> = None;
-    let mut auth: Vec<String> = Vec::new();
-    let mut log_file: Option<PathBuf> = None;
-    let mut run_as: Option<String> = None;
-    let mut timeout: u64 = 30;
-    let mut max_requests: u32 = 100;
-    let mut listen: Option<String> = None;
-    let mut socket_mode: u32 = 0o660;
-    let mut max_connections: u32 = 64;
-    let mut verbose = false;
-    let mut exposes: Vec<String> = Vec::new();
+    let mut a = Args {
+        root: PathBuf::from("."),
+        auth_file: None,
+        auth: Vec::new(),
+        log_file: None,
+        run_as: None,
+        timeout: 30,
+        max_requests: 100,
+        listen: None,
+        socket_mode: 0o660,
+        max_connections: 64,
+        verbose: false,
+        exposes: Vec::new(),
+    };
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| usage());
         match arg.as_str() {
-            "--root" => root = PathBuf::from(val()),
-            "--listen" => listen = Some(val()),
+            "--root" => a.root = PathBuf::from(val()),
+            "--listen" => a.listen = Some(val()),
             "--socket-mode" => {
-                socket_mode = u32::from_str_radix(val().trim_start_matches("0o"), 8)
+                a.socket_mode = u32::from_str_radix(val().trim_start_matches("0o"), 8)
                     .unwrap_or_else(|_| usage())
             }
-            "--max-connections" => max_connections = val().parse().unwrap_or_else(|_| usage()),
-            "-v" | "--verbose" => verbose = true,
-            "--expose" => exposes.push(val()),
-            "--auth-file" => auth_file = Some(PathBuf::from(val())),
-            "--auth" => auth.push(val()),
-            "--log-file" => log_file = Some(PathBuf::from(val())),
-            "--run-as" => run_as = Some(val()),
-            "--timeout" => timeout = val().parse().unwrap_or_else(|_| usage()),
-            "--max-requests" => max_requests = val().parse().unwrap_or_else(|_| usage()),
+            "--max-connections" => a.max_connections = val().parse().unwrap_or_else(|_| usage()),
+            "-v" | "--verbose" => a.verbose = true,
+            "--expose" => a.exposes.push(val()),
+            "--auth-file" => a.auth_file = Some(PathBuf::from(val())),
+            "--auth" => a.auth.push(val()),
+            "--log-file" => a.log_file = Some(PathBuf::from(val())),
+            "--run-as" => a.run_as = Some(val()),
+            "--timeout" => a.timeout = val().parse().unwrap_or_else(|_| usage()),
+            "--max-requests" => a.max_requests = val().parse().unwrap_or_else(|_| usage()),
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("error: unexpected argument '{}'\n", other);
@@ -122,21 +124,7 @@ fn parse_args() -> Args {
             }
         }
     }
-
-    Args {
-        root,
-        auth_file,
-        auth,
-        log_file,
-        run_as,
-        timeout,
-        max_requests,
-        listen,
-        socket_mode,
-        max_connections,
-        verbose,
-        exposes,
-    }
+    a
 }
 
 /// Parse credentials. `auth_file` is the *already-open* `--auth-file` (opened
@@ -144,9 +132,10 @@ fn parse_args() -> Args {
 /// the bug-prone work runs unprivileged. The path string is only for error text.
 fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
     let mut auth = Auth::new();
-    if let Some(file) = auth_file {
-        let source = args.auth_file.as_deref().unwrap_or(Path::new("-"));
-        auth.load(file, &source.display().to_string())?;
+    // The open file and its path are always Some together (both come from
+    // `args.auth_file`), so pair them and use the path only for error labels.
+    if let (Some(file), Some(path)) = (auth_file, &args.auth_file) {
+        auth.load(file, &path.display().to_string())?;
     }
     for pair in &args.auth {
         auth.add_pair(pair).map_err(|msg| {
@@ -464,14 +453,18 @@ fn main() {
     // verified a client cert — treat that as authentication so a cert-only
     // deployment isn't warned at.
     if !auth.is_enabled() {
-        match &args.listen {
-            Some(addr) => {
-                eprintln!("WARNING: serving unauthenticated on {} — no Basic auth", addr)
-            }
-            None if std::env::var("SSL_CLIENT_DN").unwrap_or_default().is_empty() => eprintln!(
+        if let Some(addr) = &args.listen {
+            eprintln!(
+                "WARNING: serving unauthenticated on {} — no Basic auth",
+                addr
+            );
+        } else if std::env::var("SSL_CLIENT_DN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            eprintln!(
                 "WARNING: serving unauthenticated — no client cert (SSL_CLIENT_DN) and no Basic auth"
-            ),
-            None => {}
+            );
         }
     }
 

@@ -172,11 +172,8 @@ pub fn read_request<S: BufRead>(stream: &mut S) -> io::Result<Request> {
     } else if let Some(cl) = headers.get("content-length") {
         match cl.parse::<usize>() {
             Ok(len) if len <= MAX_BODY_BYTES => {
-                // Fully-qualified: `S` and `&mut S` both implement `Read`, and plain
-                // method-call syntax resolves the ambiguity onto `S` (attempting to
-                // move `*stream`); spelling out `Self = &mut S` keeps it a reborrow.
-                let mut limited = <&mut S as Read>::take(stream, len as u64);
-                let copied = io::copy(&mut limited, &mut io::sink())?;
+                // Reborrow (`&mut *stream`) so `.take()` doesn't move `*stream`.
+                let copied = io::copy(&mut (&mut *stream).take(len as u64), &mut io::sink())?;
                 well_framed = copied == len as u64; // short copy means a truncated body
             }
             _ => well_framed = false, // oversized or unparseable
