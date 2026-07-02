@@ -33,6 +33,7 @@ struct Args {
     max_requests: u32,
     listen: Option<String>,
     socket_mode: u32,
+    socket_owner: Option<String>,
     max_connections: u32,
     verbose: bool,
     exposes: Vec<String>,
@@ -53,6 +54,9 @@ OPTIONS:
                           connection from stdin (the inetd/stunnel contract).
   --socket-mode <octal>   Permission bits for the --listen socket, e.g. 660
                           (owner+group) or 600 (owner only) (default: 660)
+  --socket-owner <user>   Give the --listen socket to this user (chown, root
+                          only) so a front-end that isn't in our group (e.g.
+                          cloudflared) can connect. Default: our own identity
   --max-connections <n>   With --listen, cap concurrent connections; excess
                           wait in the backlog (default: 64, 0 = unlimited)
   --run-as <user>         When started as root, chroot into --root and
@@ -93,6 +97,7 @@ fn parse_args() -> Args {
         max_requests: 100,
         listen: None,
         socket_mode: 0o660,
+        socket_owner: None,
         max_connections: 64,
         verbose: false,
         exposes: Vec::new(),
@@ -108,6 +113,7 @@ fn parse_args() -> Args {
                 a.socket_mode = u32::from_str_radix(val().trim_start_matches("0o"), 8)
                     .unwrap_or_else(|_| usage())
             }
+            "--socket-owner" => a.socket_owner = Some(val()),
             "--max-connections" => a.max_connections = val().parse().unwrap_or_else(|_| usage()),
             "-v" | "--verbose" => a.verbose = true,
             "--expose" => a.exposes.push(val()),
@@ -245,9 +251,17 @@ fn log_request(req: &http::Request, status: u16) {
 /// listener. A stale socket left by a previous run is removed first; a *non*-socket
 /// at the path is refused rather than clobbered. The socket is created with
 /// permission `mode` by constraining the umask across `bind()`, so there is no
-/// window where it exists more permissively than intended.
+/// window where it exists more permissively than intended. If `owner` is given
+/// (only possible as root, before the privilege drop) the socket is `chown`ed to
+/// that uid/gid, so an unrelated front-end user (e.g. cloudflared) can connect —
+/// the pre-chown window is `root`-owned, so it exposes nothing an unprivileged
+/// process could reach.
 #[cfg(unix)]
-fn bind_listener(path: &str, mode: u32) -> io::Result<std::os::unix::net::UnixListener> {
+fn bind_listener(
+    path: &str,
+    mode: u32,
+    owner: Option<(libc::uid_t, libc::gid_t)>,
+) -> io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
 
@@ -270,7 +284,22 @@ fn bind_listener(path: &str, mode: u32) -> io::Result<std::os::unix::net::UnixLi
     let prev = unsafe { libc::umask(0o777 & !mode) };
     let listener = UnixListener::bind(path);
     unsafe { libc::umask(prev) };
-    listener
+    let listener = listener?;
+
+    if let Some((uid, gid)) = owner {
+        // Must chown the *pathname*, not the fd: fchown on a bound Unix-socket fd
+        // targets its anonymous sockfs inode and silently no-ops the directory
+        // entry (returns 0, leaves it root-owned). The pre-chown window is
+        // root-owned, so re-resolving the path here exposes nothing unprivileged.
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(std::path::Path::new(path).as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
+        if unsafe { libc::chown(c_path.as_ptr(), uid, gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(listener)
 }
 
 /// Standalone daemon mode (`--listen <path>`): own a Unix-domain listening socket
@@ -426,7 +455,10 @@ fn main() {
     // while we're still root. The bound socket survives the chroot untouched.
     #[cfg(unix)]
     let listener = args.listen.as_ref().map(|path| {
-        bind_listener(path, args.socket_mode)
+        // Resolve --socket-owner while /etc/passwd is still reachable (before the
+        // chroot) and we're still root (the only case chown can succeed).
+        let owner = args.socket_owner.as_deref().map(lookup_user);
+        bind_listener(path, args.socket_mode, owner)
             .unwrap_or_else(|e| fatal(&format!("cannot listen on {}: {}", path, e)))
     });
 

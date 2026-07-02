@@ -111,6 +111,7 @@ stderr (the systemd journal) — fine here.
 | `--root` | Directory to serve (read-only) | current dir |
 | `--listen` | Create a Unix-domain socket at this path and fork per connection; no TLS. Omit to serve one connection from stdin | *(stdin)* |
 | `--socket-mode` | Octal permission bits for the `--listen` socket (`660` owner+group, `600` owner only) | `660` |
+| `--socket-owner` | `chown` the `--listen` socket to this user (root only), so a front-end that isn't in our group can connect | *(our identity)* |
 | `--max-connections` | With `--listen`, cap concurrent connections (excess wait in the backlog); `0` = unlimited | `64` |
 | `--run-as` | User to chroot+drop to when started as root (must exist) | `nobody` |
 | `--log-file` | Write diagnostics here instead of stderr (required under xinetd) | *(stderr)* |
@@ -239,6 +240,17 @@ self-confines: `chroot` into `--root` and drop to `--run-as` (default `nobody`)
 unprivileged uid and re-forbids forking for itself. Started unprivileged it
 simply serves as the current user (no chroot); running it as a dedicated
 service user is the simplest setup.
+
+**Reaching the socket from the front-end when started as root.** The socket is
+created with the *creator's* identity — `root:root` when you start as root,
+because ownership is set before the privilege drop. With `--socket-mode 660` a
+front-end running as a *different* user (e.g. `cloudflared`) then can't connect
+unless it shares the socket's group. If your front-end's user isn't in a group
+you can give the socket, hand the socket to it directly with
+`--socket-owner cloudflared`: tiny-webdav `chown`s the socket to that user while
+still root, before dropping privileges. (The alternative — a shared group plus a
+`setgid` parent directory — is fine when your packaging puts the front-end in
+such a group, but many don't.)
 
 ## Connect
 
