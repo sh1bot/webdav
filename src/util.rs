@@ -100,32 +100,12 @@ pub fn resolve_within(root: &Path, request_path: &str) -> Option<PathBuf> {
     Some(resolved)
 }
 
-/// System / metadata entries that must be hidden even though they don't begin
-/// with a dot: NAS scratch dirs and Windows/macOS turds. Matched case-insensitively
-/// (the volumes that create them are case-insensitive).
-const HIDDEN_NAMES: &[&str] = &[
-    "@eaDir",                    // Synology thumbnails/metadata
-    "#recycle",                  // Synology recycle bin
-    "#snapshot",                 // Synology snapshots
-    "@Recycle",                  // QNAP recycle bin
-    "Thumbs.db",                 // Windows Explorer thumbnails
-    "ehthumbs.db",               // Windows video thumbnails
-    "Desktop.ini",               // Windows folder config
-    "$RECYCLE.BIN",              // Windows recycle bin
-    "System Volume Information", // Windows per-volume metadata
-    "Network Trash Folder",      // macOS on network shares
-    "Temporary Items",           // macOS on network shares
-    "lost+found",                // ext filesystem fsck recovery
-    "CVS",                       // CVS metadata dir
-    "RCS",                       // RCS metadata dir
-];
-
-/// True if `name` is a hidden system/metadata *name*: any dotfile (`.git`,
-/// `.env`, `.htpasswd`, `.DS_Store`, …) or one of the known non-dot metadata names
-/// above (case-insensitive). This is the base rule, before any `--expose`
-/// overrides are applied (see [`is_hidden`]).
+/// True if `name` is a hidden system/metadata *name*: it begins with one of the
+/// scratch prefixes — `.` (dotfiles), `@` (`@eaDir`), `#` (`#recycle`), or `$`
+/// (`$RECYCLE.BIN`). This is the base rule, before any `--expose` overrides are
+/// applied (see [`is_hidden`]).
 pub fn is_hidden_name(name: &str) -> bool {
-    name.starts_with('.') || HIDDEN_NAMES.iter().any(|h| h.eq_ignore_ascii_case(name))
+    matches!(name.chars().next(), Some('.' | '@' | '#' | '$'))
 }
 
 /// Whether `name` should be hidden and never served: a hidden system name that
@@ -375,24 +355,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hidden_names_cover_dotfiles_and_system_entries() {
+    fn hidden_prefixes_are_filtered() {
         for n in [
             ".htpasswd",
             ".git",
             ".env",
             ".DS_Store",
             "@eaDir",
-            "thumbs.db", // case-insensitive
-            "SYSTEM VOLUME INFORMATION",
-            "lost+found",
+            "#recycle",
+            "$RECYCLE.BIN",
         ] {
             assert!(is_hidden_name(n), "{n} should be hidden");
         }
     }
 
     #[test]
-    fn ordinary_names_are_not_hidden() {
-        for n in ["index.html", "photo.jpg", "notes", "git", "envelope.txt"] {
+    fn ordinary_and_named_turds_are_not_hidden() {
+        // Only the .@#$ prefixes are filtered; plain names are served — including
+        // Windows turds like Desktop.ini/Thumbs.db and old VCS dirs like CVS.
+        for n in [
+            "index.html",
+            "photo.jpg",
+            "notes",
+            "git",
+            "Thumbs.db",
+            "Desktop.ini",
+            "lost+found",
+            "CVS",
+        ] {
             assert!(!is_hidden_name(n), "{n} should not be hidden");
         }
     }

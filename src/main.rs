@@ -57,10 +57,10 @@ fn usage() -> ! {
                        and any conditional/range headers (If-Modified-Since,\n                          \
                        If-None-Match, If-Range, Range, Depth)\n  \
            --expose <glob>         Re-expose an otherwise-hidden name (repeatable).\n                          \
-                       By default dotfiles (.git, .env, .htpasswd, …) and\n                          \
-                       metadata dirs (@eaDir, Thumbs.db, …) are hidden AND\n                          \
-                       refused (404). Globs use * and ?, matched per name:\n                          \
-                       e.g. --expose .mpdignore, or --expose '*' for all.\n  \
+                       Names beginning with . @ # $ (dotfiles, @eaDir,\n                          \
+                       #recycle, $RECYCLE.BIN, …) are hidden AND refused\n                          \
+                       (404). Globs use * and ?, matched per name: e.g.\n                          \
+                       --expose .mpdignore, or --expose '*' for all.\n  \
            --log-file <file>       Write diagnostics to this file. Default: stderr\n                          \
                        (captured by stunnel/systemd). Use this under xinetd,\n                          \
                        where stderr is the client socket.\n\n  \
