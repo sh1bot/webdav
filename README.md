@@ -65,6 +65,16 @@ make           # -> target/<arch>-unknown-linux-musl/release/tiny-webdav
 
 Plain `cargo build --release` gives a normal host-native (dynamic) dev build.
 
+For the smallest binary (~180 KB vs ~525 KB), `make build-min` rebuilds `std`
+from source on a **nightly** toolchain, so size-optimization and dead-code
+elimination reach `std` itself (the stable build can't touch the precompiled
+`std`, which is most of the weight). It uses unstable flags — nightly only:
+
+```sh
+make setup-min   # one-time: nightly toolchain + rust-src + musl target
+make build-min   # same output path as `make`
+```
+
 ## Test certificates
 
 `gen-certs.sh` makes a throwaway CA plus server and client certs in `certs/`:
