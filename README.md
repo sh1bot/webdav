@@ -11,9 +11,9 @@ All crypto stays in a mature, dedicated tool; the program's only dependency is
 client --TLS--> stunnel (terminates TLS, verifies client cert) --plaintext--> tiny-webdav
 ```
 
-Alternatively, with `--listen <addr>` tiny-webdav owns a plaintext TCP socket
-itself and forks a child per connection — no stunnel, no TLS. Handy on a trusted
-network or behind a TLS-terminating reverse proxy; see
+Alternatively, with `--listen <path>` tiny-webdav creates a **Unix-domain socket**
+itself and forks a child per connection — no stunnel, no TLS, no TCP. Point a
+TLS-terminating front (cloudflared, a reverse proxy) at the socket; see
 [Standalone mode](#standalone---listen-mode).
 
 ## Authentication
@@ -109,7 +109,8 @@ stderr (the systemd journal) — fine here.
 | Flag | Meaning | Default |
 |---|---|---|
 | `--root` | Directory to serve (read-only) | current dir |
-| `--listen` | Listen on `addr` (e.g. `127.0.0.1:8080`) and fork per connection; no TLS. Omit to serve one connection from stdin | *(stdin)* |
+| `--listen` | Create a Unix-domain socket at this path and fork per connection; no TLS. Omit to serve one connection from stdin | *(stdin)* |
+| `--socket-mode` | Octal permission bits for the `--listen` socket (`660` owner+group, `600` owner only) | `660` |
 | `--max-connections` | With `--listen`, cap concurrent connections (excess wait in the backlog); `0` = unlimited | `64` |
 | `--run-as` | User to chroot+drop to when started as root (must exist) | `nobody` |
 | `--log-file` | Write diagnostics here instead of stderr (required under xinetd) | *(stderr)* |
@@ -194,31 +195,51 @@ service tiny-webdav {
 
 ## Standalone (`--listen`) mode
 
-Skip stunnel entirely and let tiny-webdav own the socket:
+Skip stunnel and let tiny-webdav create and own a **Unix-domain socket**, forking
+a child per connection:
 
 ```sh
-tiny-webdav --root /srv/files --listen 0.0.0.0:8080
+tiny-webdav --root /srv/files --listen /run/tiny-webdav/sock
 ```
 
-It binds the address, then forks a child per connection. There's **no TLS** —
-use this only on a trusted network, over a VPN/SSH tunnel, or behind a separate
-TLS terminator (stunnel, nginx, Caddy). Authentication is HTTP Basic only here
-(`--auth-file` / `--auth`), since there's no TLS layer to carry client certs.
+There is **no TLS and no TCP** — put a TLS-terminating front in front of the
+socket. It pairs naturally with [cloudflared](https://github.com/cloudflare/cloudflared),
+which terminates TLS at Cloudflare's edge and tunnels to your machine (no inbound
+port, no `exec` contract — it just connects to the socket):
 
-Privilege handling mirrors the stunnel path. Start it **as root** to bind a
-privileged port (`< 1024`) and self-confine: the socket is bound while still
-root, then it `chroot`s into `--root` and drops to `--run-as` (default `nobody`)
-**once**, before the accept loop — every forked child inherits the chroot and
-unprivileged uid, and re-forbids forking for itself. Forking the already-running
-image is copy-on-write, with no `exec`. Started unprivileged (non-root, port
-`≥ 1024`) it simply serves as the current user.
+```yaml
+# cloudflared config.yml
+ingress:
+  - hostname: files.example.com
+    service: unix:/run/tiny-webdav/sock
+  - service: http_status:404
+```
 
-Concurrency is bounded by `--max-connections` (default 64): the accept loop
-serves at most that many connections at once and lets the rest wait in the
-kernel backlog, so a connection flood can't fork children without limit. Exited
-children are reaped by the loop itself (no zombie buildup). The socket is bound
-with `SO_REUSEADDR`, so a restart isn't refused while a just-closed connection
-lingers in `TIME_WAIT`.
+**Why a Unix socket, not a TCP port:** a loopback TCP port (`127.0.0.1:…`) is
+reachable by *any* local process — nothing stops another user on the box from
+bypassing Cloudflare and hitting tiny-webdav directly. A Unix socket is a
+filesystem object with an owner, group, and mode, and the kernel enforces them on
+connect. `--socket-mode 660` (the default) plus the socket's ownership restricts
+who can connect to the owner and group — so only your front-end (e.g. the
+`cloudflared` user, in the socket's group) can reach it. Use a real path, not the
+abstract namespace, precisely so the permissions apply. The socket permission
+controls *which local process* may connect, not *who the end user is* — keep HTTP
+Basic auth (`--auth` / `--auth-file`) on for user authentication.
+
+On startup tiny-webdav removes a stale socket left by a previous run (but refuses
+to touch a non-socket at that path), and creates the new one with `--socket-mode`
+applied atomically (no world-readable window). Concurrency is bounded by
+`--max-connections` (default 64): the accept loop serves at most that many at
+once and lets the rest wait in the kernel backlog, so a connection flood can't
+fork children without limit; exited children are reaped by the loop itself.
+
+Privilege handling mirrors the stunnel path. Started **as root**, it creates the
+socket (so you can place it in a root-only directory like `/run/…`) and
+self-confines: `chroot` into `--root` and drop to `--run-as` (default `nobody`)
+**once**, before the accept loop — every child inherits the chroot and
+unprivileged uid and re-forbids forking for itself. Started unprivileged it
+simply serves as the current user (no chroot); running it as a dedicated
+service user is the simplest setup.
 
 ## Connect
 

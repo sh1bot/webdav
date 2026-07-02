@@ -1,7 +1,8 @@
 //! tiny-webdav: a small read-only WebDAV server. By default it follows the inetd
 //! contract — a connection arrives on stdin (fd 0), typically from stunnel, which
-//! terminates TLS. With `--listen <addr>` it instead owns a plaintext TCP socket
-//! and forks a child per connection (no TLS). Either way a connection may carry
+//! terminates TLS. With `--listen <path>` it instead owns a Unix-domain socket it
+//! creates itself and forks a child per connection (no TLS — front it with
+//! stunnel, cloudflared, or a reverse proxy). Either way a connection may carry
 //! several requests (HTTP keep-alive).
 //!
 //! Auth is layered: client certificates are stunnel's job (we only see the
@@ -32,6 +33,7 @@ struct Args {
     timeout: u64,
     max_requests: u32,
     listen: Option<String>,
+    socket_mode: u32,
     max_connections: u32,
     verbose: bool,
     exposes: Vec<String>,
@@ -46,9 +48,12 @@ USAGE:
 
 OPTIONS:
   --root <dir>            Directory to serve (default: current directory)
-  --listen <addr>         Listen on addr (e.g. 127.0.0.1:8080) and fork a
-                          child per connection. No TLS. Default: serve one
+  --listen <path>         Create a Unix-domain socket at <path> and fork a
+                          child per connection (no TLS; front it with
+                          cloudflared/stunnel/a proxy). Default: serve one
                           connection from stdin (the inetd/stunnel contract).
+  --socket-mode <octal>   Permission bits for the --listen socket, e.g. 660
+                          (owner+group) or 600 (owner only) (default: 660)
   --max-connections <n>   With --listen, cap concurrent connections; excess
                           wait in the backlog (default: 64, 0 = unlimited)
   --run-as <user>         When started as root, chroot into --root and
@@ -89,6 +94,7 @@ fn parse_args() -> Args {
     let mut timeout: u64 = 30;
     let mut max_requests: u32 = 100;
     let mut listen: Option<String> = None;
+    let mut socket_mode: u32 = 0o660;
     let mut max_connections: u32 = 64;
     let mut verbose = false;
     let mut exposes: Vec<String> = Vec::new();
@@ -99,6 +105,10 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--root" => root = PathBuf::from(val()),
             "--listen" => listen = Some(val()),
+            "--socket-mode" => {
+                socket_mode = u32::from_str_radix(val().trim_start_matches("0o"), 8)
+                    .unwrap_or_else(|_| usage())
+            }
             "--max-connections" => max_connections = val().parse().unwrap_or_else(|_| usage()),
             "-v" | "--verbose" => verbose = true,
             "--expose" => exposes.push(val()),
@@ -127,6 +137,7 @@ fn parse_args() -> Args {
         timeout,
         max_requests,
         listen,
+        socket_mode,
         max_connections,
         verbose,
         exposes,
@@ -246,89 +257,47 @@ fn log_request(req: &http::Request, status: u16) {
     eprintln!("{}", line);
 }
 
-/// Bind a listening TCP socket with `SO_REUSEADDR`, so a quick restart isn't
-/// refused while a just-closed connection still lingers in `TIME_WAIT`. Rust's
-/// `TcpListener::bind` doesn't set the option, and it must be set *before* bind,
-/// so we build the socket by hand. `addr` is `host:port` (a literal IPv4/IPv6
-/// address works too); only the first resolved address is tried.
+/// Create the Unix-domain socket at `path`, `listen()` on it, and return the
+/// listener. A stale socket left by a previous run is removed first; a *non*-socket
+/// at the path is refused rather than clobbered. The socket is created with
+/// permission `mode` by constraining the umask across `bind()`, so there is no
+/// window where it exists more permissively than intended.
 #[cfg(unix)]
-fn bind_listener(addr: &str) -> io::Result<std::net::TcpListener> {
-    use std::net::{SocketAddr, ToSocketAddrs};
-    use std::os::unix::io::FromRawFd;
+fn bind_listener(path: &str, mode: u32) -> io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
 
-    let resolved = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to bind"))?;
-
-    // Lay the resolved address into a sockaddr_storage for bind().
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let (family, len) = match resolved {
-        SocketAddr::V4(v4) => {
-            let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
-            sin.sin_family = libc::AF_INET as libc::sa_family_t;
-            sin.sin_port = v4.port().to_be();
-            // octets() are already in network order; from_ne_bytes keeps that
-            // byte layout in s_addr regardless of host endianness.
-            sin.sin_addr = libc::in_addr {
-                s_addr: u32::from_ne_bytes(v4.ip().octets()),
-            };
-            (libc::AF_INET, std::mem::size_of::<libc::sockaddr_in>())
-        }
-        SocketAddr::V6(v6) => {
-            let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
-            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            sin6.sin6_port = v6.port().to_be();
-            sin6.sin6_addr = libc::in6_addr {
-                s6_addr: v6.ip().octets(),
-            };
-            sin6.sin6_scope_id = v6.scope_id();
-            (libc::AF_INET6, std::mem::size_of::<libc::sockaddr_in6>())
-        }
-    };
-
-    unsafe {
-        let fd = libc::socket(family, libc::SOCK_STREAM, 0);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Own the fd immediately so it's closed on any early return below.
-        let listener = std::net::TcpListener::from_raw_fd(fd);
-
-        let one: libc::c_int = 1;
-        let ok = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            (&one as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        ) == 0
-            && libc::bind(
-                fd,
-                (&storage as *const libc::sockaddr_storage).cast(),
-                len as libc::socklen_t,
-            ) == 0
-            && libc::listen(fd, libc::SOMAXCONN) == 0;
-        if !ok {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(listener)
+    // Clear a stale socket from a previous run (bind() fails with EADDRINUSE if
+    // the path exists). Only remove an actual socket — never a regular file,
+    // directory, or symlink sitting at that path.
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => std::fs::remove_file(path)?,
+        Ok(_) => fatal(&format!(
+            "--listen {}: path exists and is not a socket; refusing to remove it",
+            path
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
+
+    // `bind()` creates the socket with `0o777 & ~umask`; pin the umask so the
+    // result is exactly `mode` (no bind-then-chmod race).
+    let mode = mode & 0o777;
+    let prev = unsafe { libc::umask(0o777 & !mode) };
+    let listener = UnixListener::bind(path);
+    unsafe { libc::umask(prev) };
+    listener
 }
 
-#[cfg(not(unix))]
-fn bind_listener(addr: &str) -> io::Result<std::net::TcpListener> {
-    std::net::TcpListener::bind(addr)
-}
-
-/// Standalone daemon mode (`--listen`): own the listening socket and fork a child
-/// per connection — no TLS, for running directly rather than behind stunnel.
-/// Privileges were already dropped once (before this loop), so each child inherits
-/// the chroot and unprivileged uid for free; forking the running image is
-/// copy-on-write, with no `exec`. The child moves the connection onto fd 0/1 and
-/// runs the very same serve loop as the inetd path.
+/// Standalone daemon mode (`--listen <path>`): own a Unix-domain listening socket
+/// and fork a child per connection — no TLS, for running directly (e.g. behind
+/// cloudflared) rather than behind stunnel. Privileges were already dropped once
+/// (before this loop), so each child inherits the chroot and unprivileged uid for
+/// free; forking the running image is copy-on-write, with no `exec`. The child
+/// moves the connection onto fd 0/1 and runs the very same serve loop as the
+/// inetd path.
 #[cfg(unix)]
-fn serve_listener(listener: std::net::TcpListener, cfg: &ServeConfig) -> ! {
+fn serve_listener(listener: std::os::unix::net::UnixListener, cfg: &ServeConfig) -> ! {
     use std::os::unix::io::{AsRawFd, IntoRawFd};
 
     // We reap children ourselves (no `SIGCHLD` = `SIG_IGN`) so we can count how
@@ -401,12 +370,6 @@ fn reap_dead() -> u32 {
     n
 }
 
-#[cfg(not(unix))]
-fn serve_listener(_listener: std::net::TcpListener, _cfg: &ServeConfig) -> ! {
-    eprintln!("error: --listen is only supported on Unix platforms");
-    process::exit(1);
-}
-
 /// Best-effort `SO_RCVTIMEO` / `SO_SNDTIMEO` on the connection descriptors, so a
 /// slow or idle client can't pin the process forever. Any error (e.g. the fd
 /// isn't a socket) is ignored.
@@ -474,11 +437,13 @@ fn main() {
         })
     });
 
-    // In --listen mode, bind the socket *before* dropping privileges, so a
-    // privileged port (< 1024) can still be claimed while we're root. The bound
-    // socket survives the chroot untouched.
-    let listener = args.listen.as_ref().map(|addr| {
-        bind_listener(addr).unwrap_or_else(|e| fatal(&format!("cannot listen on {}: {}", addr, e)))
+    // In --listen mode, create the socket *before* dropping privileges, so the
+    // socket file can be placed in a directory only root can write (e.g. /run)
+    // while we're still root. The bound socket survives the chroot untouched.
+    #[cfg(unix)]
+    let listener = args.listen.as_ref().map(|path| {
+        bind_listener(path, args.socket_mode)
+            .unwrap_or_else(|e| fatal(&format!("cannot listen on {}: {}", path, e)))
     });
 
     // Everything taken from the command line is now open: --log-file is dup'd onto
@@ -488,7 +453,11 @@ fn main() {
     // what we serve from ("/" once chrooted). If we aren't root (e.g. stunnel
     // already dropped us), this is a no-op and we serve the canonical root as-is.
     // The listener forks a child per connection, so it keeps the ability to fork.
-    let serve_root = lower_privileges(&canonical_root, args.run_as.as_deref(), listener.is_some());
+    let serve_root = lower_privileges(
+        &canonical_root,
+        args.run_as.as_deref(),
+        args.listen.is_some(),
+    );
 
     // Now unprivileged: parse the (already-open) auth file and inline credentials.
     let auth = build_auth(&args, auth_file)
@@ -520,10 +489,13 @@ fn main() {
         verbose: args.verbose,
         exposes: &args.exposes,
     };
+    #[cfg(unix)]
     match listener {
         Some(l) => serve_listener(l, &cfg),
         None => serve_stdin(&cfg),
     }
+    #[cfg(not(unix))]
+    serve_stdin(&cfg);
 }
 
 /// Print a fatal error to stderr and exit non-zero.
