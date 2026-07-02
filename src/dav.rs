@@ -404,7 +404,7 @@ struct IndexEntry {
 
 /// List `fs_path`'s children that aren't hidden (per `served.exposes`) and
 /// don't resolve outside `served.root` (an escaping symlink). Shared by the
-/// HTML index and PROPFIND, which otherwise duplicated this exact filter.
+/// HTML index and PROPFIND.
 fn visible_children(served: &Served, fs_path: &Path) -> Vec<fs::DirEntry> {
     let Ok(rd) = fs::read_dir(fs_path) else {
         return Vec::new();

@@ -16,8 +16,8 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024; // PROPFIND bodies are tiny.
 
 /// The standard reason phrase for a status code this server emits. Centralized
-/// so every caller passes just the number — a status/phrase mismatch can't
-/// happen, and callers no longer repeat the phrase at every call site.
+/// so every caller passes just the number and a status/phrase mismatch can't
+/// happen.
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",

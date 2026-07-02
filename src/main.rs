@@ -152,8 +152,8 @@ fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
 }
 
 /// Everything the serve loop needs, gathered once in `main` and passed by
-/// reference so `serve_stdin`/`serve_listener` don't thread six individually
-/// growing parameters (this bundle grew one field per feature added).
+/// reference so `serve_stdin`/`serve_listener` don't take a long list of
+/// individual parameters.
 struct ServeConfig<'a> {
     root: &'a Path,
     auth: &'a Auth,
