@@ -57,9 +57,9 @@ fn usage() -> ! {
                        and any conditional/range headers (If-Modified-Since,\n                          \
                        If-None-Match, If-Range, Range, Depth)\n  \
            --expose <glob>         Re-expose an otherwise-hidden name (repeatable).\n                          \
-                       Names beginning with . @ # $ (dotfiles, @eaDir,\n                          \
-                       #recycle, $RECYCLE.BIN, …) are hidden AND refused\n                          \
-                       (404). Globs use * and ?, matched per name: e.g.\n                          \
+                       Names beginning with . @ $ (dotfiles, @eaDir,\n                          \
+                       $RECYCLE.BIN, …) are hidden AND refused (404).\n                          \
+                       Globs use * and ?, matched per name: e.g.\n                          \
                        --expose .mpdignore, or --expose '*' for all.\n  \
            --log-file <file>       Write diagnostics to this file. Default: stderr\n                          \
                        (captured by stunnel/systemd). Use this under xinetd,\n                          \

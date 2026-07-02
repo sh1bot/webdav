@@ -44,10 +44,10 @@ never an access decision.)
   connection is closed rather than risk a desync.
 - Mutating methods (`PUT`, `DELETE`, `MKCOL`, …) → `405`.
 - Path traversal (`..`) and out-of-root symlinks are rejected (as `404`).
-- Hidden system files — any name beginning with `.`, `@`, `#`, or `$` (dotfiles,
-  `@eaDir`, `#recycle`, `$RECYCLE.BIN`, …) — are omitted from listings **and**
-  refused on direct access (`404`), so nothing is hidden-but-fetchable. Re-expose
-  individual names with `--expose <glob>` (repeatable; `--expose '*'` serves all).
+- Hidden system files — any name beginning with `.`, `@`, or `$` (dotfiles,
+  `@eaDir`, `$RECYCLE.BIN`, …) — are omitted from listings **and** refused on
+  direct access (`404`), so nothing is hidden-but-fetchable. Re-expose individual
+  names with `--expose <glob>` (repeatable; `--expose '*'` serves all).
 - Two ways to run: behind stunnel on stdin (the inetd contract), or standalone
   with `--listen <addr>`, forking a child per connection.
 - Run as root, it `chroot`s into `--root` and drops privileges (see below).
@@ -137,13 +137,12 @@ files.
 
 ### Hidden system files
 
-By default the server treats any name beginning with `.`, `@`, `#`, or `$` as if
-it weren't in the tree — omitted from the HTML index and PROPFIND, and answered
-with a reveal-nothing `404` on direct access (so a client can't probe for what
-wasn't listed). The rule is applied to every path segment, so `/.git/config` is
-refused because of its `.git` ancestor. Those four prefixes cover dotfiles
-(`.git`, `.env`, `.htpasswd`, `.ssh`, …) and the common NAS scratch dirs
-(`@eaDir`, `#recycle`, `#snapshot`, `$RECYCLE.BIN`).
+By default the server treats any name beginning with `.`, `@`, or `$` as if it
+weren't in the tree — omitted from the HTML index and PROPFIND, and answered with
+a reveal-nothing `404` on direct access (so a client can't probe for what wasn't
+listed). The rule is applied to every path segment, so `/.git/config` is refused
+because of its `.git` ancestor. Those three prefixes cover dotfiles (`.git`,
+`.env`, `.htpasswd`, `.ssh`, …), Synology's `@eaDir`, and Windows' `$RECYCLE.BIN`.
 
 Plainly-named junk (`Desktop.ini`, `Thumbs.db`, `CVS`, …) is **not** filtered —
 if you want it gone, keep it off the served volume.

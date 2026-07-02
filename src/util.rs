@@ -101,11 +101,11 @@ pub fn resolve_within(root: &Path, request_path: &str) -> Option<PathBuf> {
 }
 
 /// True if `name` is a hidden system/metadata *name*: it begins with one of the
-/// scratch prefixes — `.` (dotfiles), `@` (`@eaDir`), `#` (`#recycle`), or `$`
-/// (`$RECYCLE.BIN`). This is the base rule, before any `--expose` overrides are
-/// applied (see [`is_hidden`]).
+/// scratch prefixes — `.` (dotfiles), `@` (`@eaDir`), or `$` (`$RECYCLE.BIN`).
+/// This is the base rule, before any `--expose` overrides are applied (see
+/// [`is_hidden`]).
 pub fn is_hidden_name(name: &str) -> bool {
-    matches!(name.chars().next(), Some('.' | '@' | '#' | '$'))
+    matches!(name.chars().next(), Some('.' | '@' | '$'))
 }
 
 /// Whether `name` should be hidden and never served: a hidden system name that
@@ -362,7 +362,6 @@ mod tests {
             ".env",
             ".DS_Store",
             "@eaDir",
-            "#recycle",
             "$RECYCLE.BIN",
         ] {
             assert!(is_hidden_name(n), "{n} should be hidden");
@@ -378,6 +377,7 @@ mod tests {
             "photo.jpg",
             "notes",
             "git",
+            "#recycle",
             "Thumbs.db",
             "Desktop.ini",
             "lost+found",
@@ -423,5 +423,19 @@ mod tests {
         // Path gate honours the override too.
         assert!(!path_has_hidden("/music/.mpdignore", &one));
         assert!(path_has_hidden("/music/.git/x", &one));
+    }
+
+    #[test]
+    fn exposing_a_directory_reaches_its_children() {
+        let data = [".data".to_string()];
+        // Exposed hidden dir: the dir and its (non-hidden) descendants are reachable.
+        assert!(!path_has_hidden("/.data", &data));
+        assert!(!path_has_hidden("/.data/file.txt", &data));
+        assert!(!path_has_hidden("/.data/sub/deep.txt", &data));
+        // Not exposed: the hidden ancestor blocks every child.
+        assert!(path_has_hidden("/.data/file.txt", &[]));
+        // A *nested* hidden segment is still blocked even when the parent is
+        // exposed — each segment is judged on its own.
+        assert!(path_has_hidden("/.data/.secret/x", &data));
     }
 }
