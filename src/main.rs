@@ -252,15 +252,19 @@ fn log_request(req: &http::Request, status: u16) {
 /// at the path is refused rather than clobbered. The socket is created with
 /// permission `mode` by constraining the umask across `bind()`, so there is no
 /// window where it exists more permissively than intended. If `owner` is given
-/// (only possible as root, before the privilege drop) the socket is `chown`ed to
-/// that uid/gid, so an unrelated front-end user (e.g. cloudflared) can connect —
-/// the pre-chown window is `root`-owned, so it exposes nothing an unprivileged
-/// process could reach.
+/// (only possible as root, before the privilege drop) the socket's *owner* is
+/// set to that uid so an unrelated front-end user (e.g. cloudflared) can connect
+/// via the owner permission bits; the group is deliberately left unchanged
+/// (`root`, since we bound as root). Handing the front-end the *owner* is all it
+/// needs — the group grant in the default `660` mode then only reaches `root`,
+/// rather than re-exposing the socket to whatever group the front-end user
+/// happens to belong to. The pre-chown window is `root`-owned, so re-resolving
+/// the path here exposes nothing an unprivileged process could reach.
 #[cfg(unix)]
 fn bind_listener(
     path: &str,
     mode: u32,
-    owner: Option<(libc::uid_t, libc::gid_t)>,
+    owner: Option<libc::uid_t>,
 ) -> io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
@@ -286,16 +290,19 @@ fn bind_listener(
     unsafe { libc::umask(prev) };
     let listener = listener?;
 
-    if let Some((uid, gid)) = owner {
+    if let Some(uid) = owner {
         // Must chown the *pathname*, not the fd: fchown on a bound Unix-socket fd
         // targets its anonymous sockfs inode and silently no-ops the directory
         // entry (returns 0, leaves it root-owned). The pre-chown window is
         // root-owned, so re-resolving the path here exposes nothing unprivileged.
+        // Pass gid -1 to leave the group unchanged (see the doc comment): only the
+        // owner is handed over.
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
         let c_path = CString::new(std::path::Path::new(path).as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
-        if unsafe { libc::chown(c_path.as_ptr(), uid, gid) } != 0 {
+        let keep_gid = -1i32 as libc::gid_t; // POSIX: -1 means "don't change the group"
+        if unsafe { libc::chown(c_path.as_ptr(), uid, keep_gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -456,8 +463,9 @@ fn main() {
     #[cfg(unix)]
     let listener = args.listen.as_ref().map(|path| {
         // Resolve --socket-owner while /etc/passwd is still reachable (before the
-        // chroot) and we're still root (the only case chown can succeed).
-        let owner = args.socket_owner.as_deref().map(lookup_user);
+        // chroot) and we're still root (the only case chown can succeed). Only the
+        // uid is used — the group is left as root (see bind_listener).
+        let owner = args.socket_owner.as_deref().map(|u| lookup_user(u).0);
         bind_listener(path, args.socket_mode, owner)
             .unwrap_or_else(|e| fatal(&format!("cannot listen on {}: {}", path, e)))
     });
