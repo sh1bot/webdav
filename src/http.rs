@@ -101,20 +101,27 @@ impl Request {
 pub fn read_request<S: BufRead>(stream: &mut S) -> io::Result<Request> {
     // Read the header block a line at a time until the blank line that ends it.
     // `read_until` pulls a whole line straight from the buffer, rather than one
-    // trait call per byte.
+    // trait call per byte — but it has no length cap of its own, so bound each
+    // read to the remaining header budget. Otherwise a client streaming bytes
+    // with no `\n` would grow `buf` without limit (OOM) before any size check.
     let mut buf = Vec::with_capacity(1024);
     loop {
-        let start = buf.len();
-        if stream.read_until(b'\n', &mut buf)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed before request was complete",
-            ));
-        }
-        if buf.len() > MAX_HEADER_BYTES {
+        let budget = MAX_HEADER_BYTES.saturating_sub(buf.len());
+        if budget == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "request headers too large",
+            ));
+        }
+        let start = buf.len();
+        if (&mut *stream)
+            .take(budget as u64)
+            .read_until(b'\n', &mut buf)?
+            == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before request was complete",
             ));
         }
         if &buf[start..] == b"\r\n" {

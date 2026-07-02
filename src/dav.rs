@@ -38,9 +38,8 @@ pub fn handle<S: Write + AsRawFd>(
     // escape is reported as 404 (not 403), like an out-of-root symlink, so the
     // response never reveals that the traversal filter (or a chroot) is in play.
     let decoded = util::percent_decode(&req.path);
-    let fs_path = match util::resolve_within(served.root, &decoded) {
-        Some(p) => p,
-        None => return http::write_status(stream, 404),
+    let Some(fs_path) = util::resolve_within(served.root, &decoded) else {
+        return http::write_status(stream, 404);
     };
 
     // Hidden system entries (.htpasswd, .git, @eaDir, …) are never served unless
@@ -91,9 +90,8 @@ fn get_or_head<S: Write + AsRawFd>(
     req: &Request,
     send_body: bool,
 ) -> io::Result<()> {
-    let meta = match stat_within_root(stream, served.root, fs_path)? {
-        Some(m) => m,
-        None => return Ok(()),
+    let Some(meta) = stat_within_root(stream, served.root, fs_path)? else {
+        return Ok(());
     };
 
     if meta.is_dir() {
@@ -113,13 +111,14 @@ fn get_or_head<S: Write + AsRawFd>(
     let modified = meta.modified().ok();
     let etag = etag_for(&meta);
 
+    // Both the 304 and the 200/206 paths carry the same validators; build once.
+    let mut headers = validator_headers(etag.as_deref(), modified);
+
     // Conditional GET: If-None-Match / If-Modified-Since => 304 Not Modified.
     if not_modified(req, etag.as_deref(), modified) {
-        let headers = validator_headers(etag.as_deref(), modified);
         return http::write_response(stream, 304, "", &headers, b"", false);
     }
 
-    let mut headers = validator_headers(etag.as_deref(), modified);
     // We honour single byte ranges; advertise that to clients.
     headers.push(("Accept-Ranges", "bytes".to_string()));
 
@@ -128,8 +127,7 @@ fn get_or_head<S: Write + AsRawFd>(
     // Honour Range only when there's no If-Range or its validator still matches;
     // otherwise serve the full entity (so a resumed download can't splice bytes
     // from two different versions of a file).
-    let range = req.header("range");
-    let spec = match range {
+    let spec = match req.header("range") {
         Some(r) if if_range_matches(req, etag.as_deref(), modified) => parse_byte_range(r, len),
         _ => RangeSpec::Ignore,
     };
@@ -237,11 +235,14 @@ fn stat_within_root<S: Write>(
     Ok(Some(meta))
 }
 
-/// Map a filesystem error to the appropriate HTTP status response.
+/// Map a filesystem error to the appropriate HTTP status response. A
+/// permission-denied target is reported as `404`, not `403`, so the response
+/// never reveals that an inaccessible path (e.g. a symlink to a chmod-000 or
+/// out-of-root target) exists — matching the reveal-nothing `404` used for
+/// traversal and out-of-root paths.
 fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
     let status = match e.kind() {
-        io::ErrorKind::NotFound => 404,
-        io::ErrorKind::PermissionDenied => 403,
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => 404,
         _ => 500,
     };
     http::write_status(stream, status)
@@ -342,19 +343,18 @@ enum RangeSpec {
 /// Multiple comma-separated ranges and non-`bytes` units are ignored (the
 /// caller then serves the whole file, which the spec permits).
 fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
-    let spec = match value.trim().strip_prefix("bytes=") {
-        Some(s) => s.trim(),
-        None => return RangeSpec::Ignore,
+    let Some(spec) = value.trim().strip_prefix("bytes=") else {
+        return RangeSpec::Ignore;
     };
+    let spec = spec.trim();
 
     // We only implement single ranges; a comma means a multi-range request.
     if spec.contains(',') {
         return RangeSpec::Ignore;
     }
 
-    let (start_s, end_s) = match spec.split_once('-') {
-        Some(parts) => parts,
-        None => return RangeSpec::Ignore,
+    let Some((start_s, end_s)) = spec.split_once('-') else {
+        return RangeSpec::Ignore;
     };
     let start_s = start_s.trim();
     let end_s = end_s.trim();
@@ -366,9 +366,8 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
 
     if start_s.is_empty() {
         // Suffix form: `bytes=-N` => the final N bytes.
-        let suffix: u64 = match end_s.parse() {
-            Ok(n) => n,
-            Err(_) => return RangeSpec::Ignore,
+        let Ok(suffix) = end_s.parse::<u64>() else {
+            return RangeSpec::Ignore;
         };
         if suffix == 0 {
             return RangeSpec::Unsatisfiable;
@@ -380,9 +379,8 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
         };
     }
 
-    let start: u64 = match start_s.parse() {
-        Ok(n) => n,
-        Err(_) => return RangeSpec::Ignore,
+    let Ok(start) = start_s.parse::<u64>() else {
+        return RangeSpec::Ignore;
     };
     if start >= len {
         return RangeSpec::Unsatisfiable;
@@ -494,9 +492,8 @@ fn propfind<S: Write>(
     fs_path: &Path,
     req: &Request,
 ) -> io::Result<()> {
-    let meta = match stat_within_root(stream, served.root, fs_path)? {
-        Some(m) => m,
-        None => return Ok(()),
+    let Some(meta) = stat_within_root(stream, served.root, fs_path)? else {
+        return Ok(());
     };
 
     // Depth: 0 => just this resource; 1 => this resource + immediate children.
@@ -522,7 +519,7 @@ fn propfind<S: Write>(
     xml.push_str("<D:multistatus xmlns:D=\"DAV:\">\n");
 
     // The resource itself.
-    xml.push_str(&response_xml(decoded_path, &meta, fs_path));
+    response_xml(&mut xml, decoded_path, &meta, fs_path);
 
     // Immediate children, if this is a collection and depth allows it.
     if meta.is_dir() && include_children {
@@ -534,8 +531,8 @@ fn propfind<S: Write>(
             // Follow symlinks (matching GET); list un-stattable entries with
             // a 404 propstat rather than dropping them from the listing.
             match fs::metadata(&path) {
-                Ok(child_meta) => xml.push_str(&response_xml(&child_path, &child_meta, &path)),
-                Err(_) => xml.push_str(&response_failed_xml(&child_path)),
+                Ok(child_meta) => response_xml(&mut xml, &child_path, &child_meta, &path),
+                Err(_) => response_failed_xml(&mut xml, &child_path),
             }
         }
     }
@@ -552,8 +549,9 @@ fn propfind<S: Write>(
     )
 }
 
-/// Build one `<D:response>` block describing a single resource.
-fn response_xml(href_path: &str, meta: &fs::Metadata, fs_path: &Path) -> String {
+/// Append one `<D:response>` block describing a single resource to `out`
+/// (written in place, so a Depth: 1 listing doesn't allocate a String per child).
+fn response_xml(out: &mut String, href_path: &str, meta: &fs::Metadata, fs_path: &Path) {
     let is_dir = meta.is_dir();
 
     // Collections must end with a trailing slash in their href.
@@ -574,18 +572,17 @@ fn response_xml(href_path: &str, meta: &fs::Metadata, fs_path: &Path) -> String 
         .map(util::http_date)
         .unwrap_or_else(|_| util::http_date(SystemTime::UNIX_EPOCH));
 
-    let mut block = String::new();
     let _ = write!(
-        block,
+        out,
         "  <D:response>\n    <D:href>{href}</D:href>\n    <D:propstat>\n      <D:prop>\n        \
          <D:displayname>{}</D:displayname>\n        <D:getlastmodified>{modified}</D:getlastmodified>\n",
         util::xml_escape(&display),
     );
     if is_dir {
-        block.push_str("        <D:resourcetype><D:collection/></D:resourcetype>\n");
+        out.push_str("        <D:resourcetype><D:collection/></D:resourcetype>\n");
     } else {
         let _ = write!(
-            block,
+            out,
             "        <D:resourcetype/>\n        <D:getcontentlength>{}</D:getcontentlength>\n        \
              <D:getcontenttype>{}</D:getcontenttype>\n",
             meta.len(),
@@ -593,19 +590,19 @@ fn response_xml(href_path: &str, meta: &fs::Metadata, fs_path: &Path) -> String 
         );
         // Same strong validator GET sends as ETag; the value has no XML specials.
         if let Some(etag) = etag_for(meta) {
-            let _ = writeln!(block, "        <D:getetag>{etag}</D:getetag>");
+            let _ = writeln!(out, "        <D:getetag>{etag}</D:getetag>");
         }
     }
-    block.push_str("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n  </D:response>\n");
-    block
+    out.push_str("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n  </D:response>\n");
 }
 
-/// A `<D:response>` for an entry whose metadata couldn't be read: list the
-/// href with a 404 status so the client sees a complete (if partial) listing.
-fn response_failed_xml(href_path: &str) -> String {
-    format!(
+/// Append a `<D:response>` for an entry whose metadata couldn't be read: list
+/// the href with a 404 status so the client sees a complete (if partial) listing.
+fn response_failed_xml(out: &mut String, href_path: &str) {
+    let _ = write!(
+        out,
         "  <D:response>\n    <D:href>{}</D:href>\n    \
          <D:status>HTTP/1.1 404 Not Found</D:status>\n  </D:response>\n",
         util::percent_encode_path(href_path)
-    )
+    );
 }

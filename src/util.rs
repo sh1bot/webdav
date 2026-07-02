@@ -6,8 +6,9 @@ use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Decode `%XX` escapes in a URL path segment string into raw bytes, then
-/// interpret as UTF-8 (lossily). Stops decoding at `?` (query) and `#`.
+/// Decode `%XX` escapes in a URL path string into raw bytes, then interpret as
+/// UTF-8 (lossily). The caller has already stripped any `?`/`#` (see
+/// `http::read_request`), so the whole input is decoded.
 pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

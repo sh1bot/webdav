@@ -428,17 +428,15 @@ fn main() {
     // Open --auth-file now, before the chroot/drop, while its path is reachable
     // and we still have the privilege to read it — but don't parse it yet. The
     // parsing happens after the drop, so that bug-prone work runs unprivileged.
-    let auth_file = match &args.auth_file {
-        Some(path) => match File::open(path) {
-            Ok(f) => Some(f),
-            Err(e) => fatal(&format!(
+    let auth_file = args.auth_file.as_ref().map(|path| {
+        File::open(path).unwrap_or_else(|e| {
+            fatal(&format!(
                 "cannot open --auth-file {}: {}",
                 path.display(),
                 e
-            )),
-        },
-        None => None,
-    };
+            ))
+        })
+    });
 
     // In --listen mode, bind the socket *before* dropping privileges, so a
     // privileged port (< 1024) can still be claimed while we're root. The bound
@@ -470,7 +468,7 @@ fn main() {
             Some(addr) => {
                 eprintln!("WARNING: serving unauthenticated on {} — no Basic auth", addr)
             }
-            None if !std::env::var("SSL_CLIENT_DN").is_ok_and(|v| !v.is_empty()) => eprintln!(
+            None if std::env::var("SSL_CLIENT_DN").unwrap_or_default().is_empty() => eprintln!(
                 "WARNING: serving unauthenticated — no client cert (SSL_CLIENT_DN) and no Basic auth"
             ),
             None => {}
@@ -599,29 +597,24 @@ fn lower_privileges(root: &Path, run_as: Option<&str>, may_fork: bool) -> PathBu
     }
 
     // Assert the privilege outcome by reading back the real, effective AND saved
-    // uids. We must never end up with any of them as root.
+    // uids. We must never end up with any of them as root — checked in *every*
+    // case, so an explicit `--run-as root` (or a target account misconfigured to
+    // uid 0) can't slip through the target-match branch below.
     let (mut ruid, mut euid_now, mut suid) = (0, 0, 0);
     unsafe { libc::getresuid(&mut ruid, &mut euid_now, &mut suid) };
-    match run_as {
-        // --run-as given: all three uids must actually be that user now (whether
-        // we just dropped to it, or were already running as it). Also covers the
-        // case where it couldn't be honoured because we weren't root.
-        Some(name) => {
-            let (uid, _gid) = creds.unwrap();
-            if (ruid, euid_now, suid) != (uid, uid, uid) {
-                fatal(&format!(
-                    "--run-as {:?}: not that user (uids r={} e={} s={}, want {})",
-                    name, ruid, euid_now, suid, uid
-                ));
-            }
-        }
-        // No target requested: at minimum none of the uids may be root. (Guards
-        // against a misconfigured `nobody` mapped to uid 0 — where the drop is a
-        // no-op — and against a leftover saved-uid 0.)
-        None => {
-            if ruid == 0 || euid_now == 0 || suid == 0 {
-                fatal("refusing to serve as root; run unprivileged or pass --run-as");
-            }
+    if ruid == 0 || euid_now == 0 || suid == 0 {
+        fatal("refusing to serve as root; run unprivileged or pass --run-as <non-root user>");
+    }
+    // With --run-as, also confirm all three uids are actually that user now —
+    // this catches the case where we couldn't change uid (not root) and weren't
+    // already running as it.
+    if let Some(name) = run_as {
+        let (uid, _gid) = creds.unwrap();
+        if (ruid, euid_now, suid) != (uid, uid, uid) {
+            fatal(&format!(
+                "--run-as {:?}: not that user (uids r={} e={} s={}, want {})",
+                name, ruid, euid_now, suid, uid
+            ));
         }
     }
 
