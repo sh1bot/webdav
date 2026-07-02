@@ -17,15 +17,13 @@ use std::io::{self, Read};
 use crate::http::{self, Request};
 
 pub struct Auth {
-    realm: String,
     /// username -> password. Empty means authentication is disabled.
     creds: HashMap<String, String>,
 }
 
 impl Auth {
-    pub fn new(realm: String) -> Self {
+    pub fn new() -> Self {
         Auth {
-            realm,
             creds: HashMap::new(),
         }
     }
@@ -104,7 +102,7 @@ impl Auth {
             "text/plain; charset=utf-8",
             &[(
                 "WWW-Authenticate",
-                format!("Basic realm=\"{}\", charset=\"UTF-8\"", self.realm),
+                "Basic realm=\"webdav\", charset=\"UTF-8\"".to_string(),
             )],
             b"401 Unauthorized\n",
             true,

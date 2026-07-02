@@ -116,7 +116,6 @@ stderr (the systemd journal) — fine here.
 | `--log-file` | Write diagnostics here instead of stderr (required under xinetd) | *(stderr)* |
 | `--auth-file` | File of `username:password` lines (`#` comments; password may contain `:`) | *(none)* |
 | `--auth` | An inline `username:password` credential (repeatable) | *(none)* |
-| `--realm` | Basic-auth realm | `tiny-webdav` |
 | `--timeout` | Per-read/write timeout in seconds, incl. the wait for the next keep-alive request (`0` disables) | `30` |
 | `--max-requests` | Max requests served on one connection before closing (`0` = unlimited) | `100` |
 | `-v`, `--verbose` | Log one line per request (method, path, status, conditional/range headers) to stderr | *(off)* |

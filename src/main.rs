@@ -27,7 +27,6 @@ struct Args {
     root: PathBuf,
     auth_file: Option<PathBuf>,
     auth: Vec<String>,
-    realm: String,
     log_file: Option<PathBuf>,
     run_as: Option<String>,
     timeout: u64,
@@ -78,7 +77,6 @@ OPTIONS:
   --auth-file <file>      File of 'username:password' lines (# comments)
   --auth <user:pass>      An inline credential (repeatable; password may
                           contain ':')
-  --realm <realm>         Basic-auth realm shown to clients (default: tiny-webdav)
 "
     );
     process::exit(2);
@@ -88,7 +86,6 @@ fn parse_args() -> Args {
     let mut root = PathBuf::from(".");
     let mut auth_file: Option<PathBuf> = None;
     let mut auth: Vec<String> = Vec::new();
-    let mut realm = "tiny-webdav".to_string();
     let mut log_file: Option<PathBuf> = None;
     let mut run_as: Option<String> = None;
     let mut timeout: u64 = 30;
@@ -114,7 +111,6 @@ fn parse_args() -> Args {
             "--expose" => exposes.push(val()),
             "--auth-file" => auth_file = Some(PathBuf::from(val())),
             "--auth" => auth.push(val()),
-            "--realm" => realm = val(),
             "--log-file" => log_file = Some(PathBuf::from(val())),
             "--run-as" => run_as = Some(val()),
             "--timeout" => timeout = val().parse().unwrap_or_else(|_| usage()),
@@ -131,7 +127,6 @@ fn parse_args() -> Args {
         root,
         auth_file,
         auth,
-        realm,
         log_file,
         run_as,
         timeout,
@@ -148,7 +143,7 @@ fn parse_args() -> Args {
 /// before the chroot/privilege drop); parsing it happens here, after the drop, so
 /// the bug-prone work runs unprivileged. The path string is only for error text.
 fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
-    let mut auth = Auth::new(args.realm.clone());
+    let mut auth = Auth::new();
     if let Some(file) = auth_file {
         let source = args.auth_file.as_deref().unwrap_or(Path::new("-"));
         auth.load(file, &source.display().to_string())?;
