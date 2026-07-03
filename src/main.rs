@@ -184,9 +184,15 @@ fn serve_stdin(cfg: &ServeConfig) {
         set_socket_timeouts(cfg.timeout);
     }
 
-    let served_root = dav::Served {
-        root: cfg.root,
-        exposes: cfg.exposes,
+    // Validate the served root here — deliberately after `lower_privileges` has
+    // chrooted and dropped to the unprivileged user. Two ordering constraints
+    // ride on this: the chroot fixes what `cfg.root` (`/`) resolves to, and the
+    // readability check (`access(2)`, real-uid) must reflect the dropped user —
+    // as root it would pass via DAC override and mislead a later GET. So this
+    // must not be hoisted ahead of the privilege drop.
+    let Some(served_root) = dav::Served::new(cfg.root, cfg.exposes) else {
+        eprintln!("cannot serve: --root is not a readable directory");
+        return;
     };
 
     // BufReader gives us cheap byte-at-a-time header parsing (one syscall per

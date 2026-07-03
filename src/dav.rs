@@ -13,127 +13,184 @@ use crate::auth::Auth;
 use crate::http::{self, Request};
 use crate::util;
 
+use safe::SafePath;
+
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND";
 
-/// The static, per-server configuration every handler needs: the served root
-/// (for the symlink-escape check) and the `--expose` overrides (for the
-/// hidden-file gate).
+/// The static, per-server configuration every handler needs: the validated
+/// served root (the trust anchor every request path is resolved against) and the
+/// `--expose` overrides.
 pub struct Served<'a> {
-    pub root: &'a Path,
-    pub exposes: &'a [String],
+    root: SafePath,
+    exposes: &'a [String],
 }
 
-/// A filesystem path that has passed the one universal acceptability test:
-/// it resolves inside the served root (no `..` and no symlink escape), no
-/// component is a hidden system name (unless `--expose`d), and its target is
-/// readable by us. A `SafePath` can *only* be produced by [`Served::accept`] or
-/// [`Served::children`], so a request string can never reach the filesystem
-/// without passing the test, and holding one means the checks are already done —
-/// nothing downstream re-validates. The `Metadata` stat'd during the check is
-/// carried along so callers don't stat again.
-pub struct SafePath {
-    // Owned (both constructors mint a fresh path — nothing outlives them to
-    // borrow), but boxed rather than a PathBuf: the path is fixed once the checks
-    // pass, so we don't need PathBuf's growable spare capacity.
-    path: Box<Path>,
-    meta: fs::Metadata,
-}
-
-impl SafePath {
-    fn path(&self) -> &Path {
-        &self.path
-    }
-    fn meta(&self) -> &fs::Metadata {
-        &self.meta
-    }
-    fn is_dir(&self) -> bool {
-        self.meta.is_dir()
-    }
-    /// The leaf name, lossily decoded, for hrefs and display.
-    fn name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/".to_string())
-    }
-}
-
-impl Served<'_> {
-    /// The universal acceptability test: turn a decoded request path into a
-    /// [`SafePath`], or `None` (⇒ a reveal-nothing 404) if it escapes the root
-    /// via `..`, names a hidden component, resolves through a symlink to outside
-    /// the root, or isn't readable by us. This is the ONE place a request string
-    /// becomes a filesystem path.
-    fn accept(&self, request_path: &str) -> Option<SafePath> {
-        // String-level checks first: reject `..`/absolute escapes, then any
-        // hidden component anywhere in the request path.
-        let path = util::resolve_within(self.root, request_path)?;
-        if util::path_has_hidden(request_path, self.exposes) {
-            return None;
-        }
-        // Filesystem-level checks: it must exist and stat, resolve (through any
-        // symlinks) inside the root, and be readable.
-        let meta = fs::metadata(&path).ok()?;
-        if !within_root(self.root, &path) || !is_readable(&path) {
-            return None;
-        }
-        Some(SafePath {
-            path: path.into_boxed_path(),
-            meta,
-        })
-    }
-
-    /// Iterate the acceptable children of an already-trusted directory,
-    /// streamwise — no `Vec` of entries is built. Because `dir` is a `SafePath`
-    /// (its whole ancestry is validated by type), each entry is judged on its
-    /// *leaf* alone, without re-parsing the parent chain: see [`accept_child`].
-    fn children<'s>(&'s self, dir: &SafePath) -> impl Iterator<Item = SafePath> + 's {
-        fs::read_dir(&dir.path)
-            .ok()
-            .into_iter()
-            .flatten() // ReadDir → io::Result<DirEntry>
-            .filter_map(Result::ok) // drop entries we couldn't read
-            .filter_map(move |entry| self.accept_child(entry))
-    }
-
-    /// Accept one child of a trusted directory by its leaf only. The parent is
-    /// already known to sit inside the root, so a *non-symlink* child is inside
-    /// the root by construction (a single normal component can't climb out) —
-    /// only a symlink can point elsewhere, so we pay for the escape check
-    /// (`within_root`'s `canonicalize`) solely in that case. Hidden and
-    /// readability are judged on this entry alone.
-    fn accept_child(&self, entry: fs::DirEntry) -> Option<SafePath> {
-        let name = entry.file_name();
-        if util::is_hidden(&name.to_string_lossy(), self.exposes) {
-            return None;
-        }
-        let path = entry.path();
-        // A symlink (or an entry whose type we couldn't determine) is the only
-        // way a child could resolve outside the root; check just those.
-        let maybe_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
-        if maybe_symlink && !within_root(self.root, &path) {
-            return None;
-        }
-        let meta = fs::metadata(&path).ok()?; // follows the symlink to its target
-        if !is_readable(&path) {
-            return None;
-        }
-        Some(SafePath {
-            path: path.into_boxed_path(),
-            meta,
+impl<'a> Served<'a> {
+    /// Validate the served root and bundle it with the expose overrides.
+    /// `None` if `root` isn't a directory we can read.
+    pub fn new(root: &Path, exposes: &'a [String]) -> Option<Served<'a>> {
+        Some(Served {
+            root: SafePath::root(root)?,
+            exposes,
         })
     }
 }
 
-/// True if we can read `path` (following symlinks) as the user we now run as —
-/// the same permission `File::open` needs, so the listing never advertises a
-/// file a GET would then 404. `access(2)` uses the real uid, which equals our
-/// effective uid after the privilege drop.
-fn is_readable(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    match std::ffi::CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => (unsafe { libc::access(c.as_ptr(), libc::R_OK) }) == 0,
-        Err(_) => false, // interior NUL: not a real path
+/// Path acceptability, sealed. `SafePath`'s fields are private to this module
+/// and it has no public literal form, so the *only* way to obtain one anywhere
+/// in the crate is through the constructors below — each of which runs the full
+/// acceptability test. Code elsewhere in `dav` can read a `SafePath` but can
+/// never fabricate one that skipped the checks.
+mod safe {
+    use std::fs;
+    use std::path::Path;
+
+    use crate::util;
+
+    /// A path we are permitted to serve: it exists, is readable by us, resolves
+    /// inside the served root (no `..`, no symlink escape), and — for a path
+    /// derived from a request — names no hidden component. The served root itself
+    /// is the base case (there is no request part to check). Holding one means
+    /// those checks have passed; the `Metadata` stat'd during the check is
+    /// carried along so callers don't stat again.
+    pub struct SafePath {
+        // Owned (every constructor mints a fresh path — nothing outlives them to
+        // borrow), but boxed rather than a PathBuf: the path is fixed once the
+        // checks pass, so we don't need PathBuf's growable spare capacity.
+        path: Box<Path>,
+        meta: fs::Metadata,
+    }
+
+    impl SafePath {
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+        pub fn meta(&self) -> &fs::Metadata {
+            &self.meta
+        }
+        pub fn is_dir(&self) -> bool {
+            self.meta.is_dir()
+        }
+        /// The leaf name, lossily decoded, for hrefs and display.
+        pub fn name(&self) -> String {
+            self.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string())
+        }
+
+        /// The trust anchor: wrap the served root. It isn't subject to the
+        /// request-relative checks (there is no request part yet) — we only
+        /// confirm it's a directory we can read. Every other `SafePath` is derived
+        /// from this one via [`accept`](Self::accept)/[`children`](Self::children).
+        pub fn root(dir: &Path) -> Option<SafePath> {
+            let meta = fs::metadata(dir).ok()?;
+            let ok = meta.is_dir() && is_readable(dir);
+            ok.then(|| SafePath {
+                path: dir.into(),
+                meta,
+            })
+        }
+
+        /// The universal acceptability test: turn a decoded request path into a
+        /// `SafePath` under `root`, or `None` (⇒ a reveal-nothing 404) if it
+        /// escapes the root via `..`, names a hidden component, resolves through a
+        /// symlink to outside the root, or isn't readable by us. This is the ONE
+        /// place a request string becomes a filesystem path.
+        pub fn accept(root: &SafePath, exposes: &[String], request_path: &str) -> Option<SafePath> {
+            // String-level checks first: reject `..`/absolute escapes, then any
+            // hidden component anywhere in the request path.
+            let path = util::resolve_within(root.path(), request_path)?;
+            if util::path_has_hidden(request_path, exposes) {
+                return None;
+            }
+            // Filesystem-level checks: it must exist and stat, resolve (through
+            // any symlinks) inside the root, and be readable.
+            let meta = fs::metadata(&path).ok()?;
+            if !within_root(root.path(), &path) || !is_readable(&path) {
+                return None;
+            }
+            Some(SafePath {
+                path: path.into_boxed_path(),
+                meta,
+            })
+        }
+
+        /// Iterate the acceptable children of this (already-trusted) directory,
+        /// streamwise — no `Vec` of entries is built. Because `self` is a
+        /// `SafePath` (its whole ancestry is validated by type), each entry is
+        /// judged on its *leaf* alone, without re-parsing the parent chain.
+        pub fn children<'a>(
+            &self,
+            root: &'a SafePath,
+            exposes: &'a [String],
+        ) -> impl Iterator<Item = SafePath> + 'a {
+            fs::read_dir(&self.path)
+                .ok()
+                .into_iter()
+                .flatten() // ReadDir → io::Result<DirEntry>
+                .filter_map(Result::ok) // drop entries we couldn't read
+                .filter_map(move |entry| SafePath::accept_child(root, exposes, entry))
+        }
+
+        /// Accept one child of a trusted directory by its leaf only. The parent is
+        /// already known to sit inside the root, so a *non-symlink* child is inside
+        /// the root by construction (a single normal component can't climb out) —
+        /// only a symlink can point elsewhere, so we pay for the escape check
+        /// (`within_root`'s `canonicalize`) solely in that case. Hidden and
+        /// readability are judged on this entry alone.
+        fn accept_child(
+            root: &SafePath,
+            exposes: &[String],
+            entry: fs::DirEntry,
+        ) -> Option<SafePath> {
+            let name = entry.file_name();
+            if util::is_hidden(&name.to_string_lossy(), exposes) {
+                return None;
+            }
+            let path = entry.path();
+            // A symlink (or an entry whose type we couldn't determine) is the only
+            // way a child could resolve outside the root; check just those.
+            let maybe_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if maybe_symlink && !within_root(root.path(), &path) {
+                return None;
+            }
+            let meta = fs::metadata(&path).ok()?; // follows the symlink to its target
+            if !is_readable(&path) {
+                return None;
+            }
+            Some(SafePath {
+                path: path.into_boxed_path(),
+                meta,
+            })
+        }
+    }
+
+    /// True if `fs_path`, fully resolved (following symlinks), is still inside
+    /// `root`. When the server has chrooted, `root` is `/` so nothing can be
+    /// outside it — short-circuit and skip the per-path `canonicalize`. Otherwise
+    /// resolve and check the prefix, which stops a symlink under the served tree
+    /// from escaping.
+    fn within_root(root: &Path, fs_path: &Path) -> bool {
+        if root == Path::new("/") {
+            return true;
+        }
+        match fs_path.canonicalize() {
+            Ok(real) => real.starts_with(root),
+            Err(_) => false,
+        }
+    }
+
+    /// True if we can read `path` (following symlinks) as the user we now run as —
+    /// the same permission `File::open` needs, so a listing never advertises a
+    /// file a GET would then 404. `access(2)` uses the real uid, which equals our
+    /// effective uid after the privilege drop.
+    fn is_readable(path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            Ok(c) => (unsafe { libc::access(c.as_ptr(), libc::R_OK) }) == 0,
+            Err(_) => false, // interior NUL: not a real path
+        }
     }
 }
 
@@ -170,7 +227,7 @@ pub fn handle<S: Write + AsRawFd>(
     // passing the universal acceptability test. Any rejection is a 404 that
     // reveals nothing about why (missing, hidden, escaping, or unreadable).
     let decoded = util::percent_decode(&req.path);
-    let Some(target) = served.accept(&decoded) else {
+    let Some(target) = SafePath::accept(&served.root, served.exposes, &decoded) else {
         return http::write_status(stream, 404);
     };
 
@@ -337,20 +394,6 @@ fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
         _ => 500,
     };
     http::write_status(stream, status)
-}
-
-/// True if `fs_path`, fully resolved (following symlinks), is still inside
-/// `root`. When the server has chrooted, `root` is `/` so nothing can be outside
-/// it — short-circuit and skip the per-path `canonicalize`. Otherwise resolve and
-/// check the prefix, which stops a symlink under the served tree from escaping.
-fn within_root(root: &Path, fs_path: &Path) -> bool {
-    if root == Path::new("/") {
-        return true;
-    }
-    match fs_path.canonicalize() {
-        Ok(real) => real.starts_with(root),
-        Err(_) => false,
-    }
 }
 
 /// A strong validator built from size and mtime, e.g. `"1f-65a3b2c0"`.
@@ -552,7 +595,7 @@ fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) 
              <td></td><td></td></tr>",
         );
     }
-    for child in served.children(target) {
+    for child in target.children(&served.root, served.exposes) {
         let name = child.name();
         let is_dir = child.is_dir();
         let suffix = if is_dir { "/" } else { "" };
@@ -615,7 +658,7 @@ fn propfind<S: Write>(
     // unreadable or hidden entry is simply absent, never a 404 stub).
     if target.is_dir() && include_children {
         let base = util::with_trailing_slash(decoded_path);
-        for child in served.children(target) {
+        for child in target.children(&served.root, served.exposes) {
             let child_path = format!("{}{}", base, child.name());
             response_xml(&mut xml, &child_path, &child);
         }
