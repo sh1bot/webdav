@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::Auth;
@@ -32,7 +32,10 @@ pub struct Served<'a> {
 /// nothing downstream re-validates. The `Metadata` stat'd during the check is
 /// carried along so callers don't stat again.
 pub struct SafePath {
-    path: PathBuf,
+    // Owned (both constructors mint a fresh path — nothing outlives them to
+    // borrow), but boxed rather than a PathBuf: the path is fixed once the checks
+    // pass, so we don't need PathBuf's growable spare capacity.
+    path: Box<Path>,
     meta: fs::Metadata,
 }
 
@@ -74,7 +77,10 @@ impl Served<'_> {
         if !within_root(self.root, &path) || !is_readable(&path) {
             return None;
         }
-        Some(SafePath { path, meta })
+        Some(SafePath {
+            path: path.into_boxed_path(),
+            meta,
+        })
     }
 
     /// Iterate the acceptable children of an already-trusted directory,
@@ -112,7 +118,10 @@ impl Served<'_> {
         if !is_readable(&path) {
             return None;
         }
-        Some(SafePath { path, meta })
+        Some(SafePath {
+            path: path.into_boxed_path(),
+            meta,
+        })
     }
 }
 
