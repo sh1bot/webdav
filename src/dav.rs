@@ -268,7 +268,7 @@ fn get_or_head<S: Write + AsRawFd>(
         content_type,
         headers: &headers,
     };
-    stream_file(stream, target.path(), offset, count, &resp, send_body)
+    stream_file(stream, target, offset, count, &resp, send_body)
 }
 
 /// Build the `Last-Modified`/`ETag` headers shared by the 304 and 200/206 paths.
@@ -299,7 +299,7 @@ struct Resp<'a> {
 /// large files never sit in memory.
 fn stream_file<S: Write + AsRawFd>(
     stream: &mut S,
-    fs_path: &Path,
+    target: &SafePath,
     offset: u64,
     count: u64,
     resp: &Resp,
@@ -308,7 +308,7 @@ fn stream_file<S: Write + AsRawFd>(
     // Open before writing the header so a failure can still be reported as an
     // error response rather than a truncated body. sendfile takes the offset
     // directly, so there is no need to seek.
-    let file = match fs::File::open(fs_path) {
+    let file = match fs::File::open(target.path()) {
         Ok(f) => f,
         Err(e) => return err_status(stream, &e),
     };
