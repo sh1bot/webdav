@@ -6,7 +6,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::Auth;
@@ -14,27 +13,9 @@ use crate::http::{self, Request};
 use crate::util;
 
 use safe::SafePath;
+pub use safe::Served;
 
 const ALLOW: &str = "OPTIONS, GET, HEAD, PROPFIND";
-
-/// The static, per-server configuration every handler needs: the validated
-/// served root (the trust anchor every request path is resolved against) and the
-/// `--expose` overrides.
-pub struct Served<'a> {
-    root: SafePath,
-    exposes: &'a [String],
-}
-
-impl<'a> Served<'a> {
-    /// Validate the served root and bundle it with the expose overrides.
-    /// `None` if `root` isn't a directory we can read.
-    pub fn new(root: &Path, exposes: &'a [String]) -> Option<Served<'a>> {
-        Some(Served {
-            root: SafePath::root(root)?,
-            exposes,
-        })
-    }
-}
 
 /// Path acceptability, sealed. `SafePath`'s fields are private to this module
 /// and it has no public literal form, so the *only* way to obtain one anywhere
@@ -46,6 +27,28 @@ mod safe {
     use std::path::Path;
 
     use crate::util;
+
+    /// The serving context: the validated root (the trust anchor) and the
+    /// `--expose` overrides, bound together. Every acceptability check reads its
+    /// root and exposes from here, so the two are never passed as a loose,
+    /// possibly-mismatched pair. Its fields are private to this module, so code in
+    /// `dav` can pass a `Served` around but can neither pick it apart nor build a
+    /// rogue one with an unchecked root — the only constructor is [`Served::new`].
+    pub struct Served<'a> {
+        root: SafePath,
+        exposes: &'a [String],
+    }
+
+    impl<'a> Served<'a> {
+        /// Validate the served root and bundle it with the expose overrides.
+        /// `None` if `root` isn't a directory we can read.
+        pub fn new(root: &Path, exposes: &'a [String]) -> Option<Served<'a>> {
+            Some(Served {
+                root: SafePath::root(root)?,
+                exposes,
+            })
+        }
+    }
 
     /// A path we are permitted to serve: it exists, is readable by us, resolves
     /// inside the served root (no `..`, no symlink escape), and — for a path
@@ -93,21 +96,21 @@ mod safe {
         }
 
         /// The universal acceptability test: turn a decoded request path into a
-        /// `SafePath` under `root`, or `None` (⇒ a reveal-nothing 404) if it
-        /// escapes the root via `..`, names a hidden component, resolves through a
-        /// symlink to outside the root, or isn't readable by us. This is the ONE
+        /// `SafePath` under `served`'s root, or `None` (⇒ a reveal-nothing 404) if
+        /// it escapes the root via `..`, names a hidden component, resolves through
+        /// a symlink to outside the root, or isn't readable by us. This is the ONE
         /// place a request string becomes a filesystem path.
-        pub fn accept(root: &SafePath, exposes: &[String], request_path: &str) -> Option<SafePath> {
+        pub fn accept(served: &Served, request_path: &str) -> Option<SafePath> {
             // String-level checks first: reject `..`/absolute escapes, then any
             // hidden component anywhere in the request path.
-            let path = util::resolve_within(root.path(), request_path)?;
-            if util::path_has_hidden(request_path, exposes) {
+            let path = util::resolve_within(served.root.path(), request_path)?;
+            if util::path_has_hidden(request_path, served.exposes) {
                 return None;
             }
             // Filesystem-level checks: it must exist and stat, resolve (through
             // any symlinks) inside the root, and be readable.
             let meta = fs::metadata(&path).ok()?;
-            if !within_root(root.path(), &path) || !is_readable(&path) {
+            if !within_root(served.root.path(), &path) || !is_readable(&path) {
                 return None;
             }
             Some(SafePath {
@@ -120,17 +123,13 @@ mod safe {
         /// streamwise — no `Vec` of entries is built. Because `self` is a
         /// `SafePath` (its whole ancestry is validated by type), each entry is
         /// judged on its *leaf* alone, without re-parsing the parent chain.
-        pub fn children<'a>(
-            &self,
-            root: &'a SafePath,
-            exposes: &'a [String],
-        ) -> impl Iterator<Item = SafePath> + 'a {
+        pub fn children<'c>(&self, served: &'c Served) -> impl Iterator<Item = SafePath> + 'c {
             fs::read_dir(&self.path)
                 .ok()
                 .into_iter()
                 .flatten() // ReadDir → io::Result<DirEntry>
                 .filter_map(Result::ok) // drop entries we couldn't read
-                .filter_map(move |entry| SafePath::accept_child(root, exposes, entry))
+                .filter_map(move |entry| SafePath::accept_child(served, entry))
         }
 
         /// Accept one child of a trusted directory by its leaf only. The parent is
@@ -139,20 +138,16 @@ mod safe {
         /// only a symlink can point elsewhere, so we pay for the escape check
         /// (`within_root`'s `canonicalize`) solely in that case. Hidden and
         /// readability are judged on this entry alone.
-        fn accept_child(
-            root: &SafePath,
-            exposes: &[String],
-            entry: fs::DirEntry,
-        ) -> Option<SafePath> {
+        fn accept_child(served: &Served, entry: fs::DirEntry) -> Option<SafePath> {
             let name = entry.file_name();
-            if util::is_hidden(&name.to_string_lossy(), exposes) {
+            if util::is_hidden(&name.to_string_lossy(), served.exposes) {
                 return None;
             }
             let path = entry.path();
             // A symlink (or an entry whose type we couldn't determine) is the only
             // way a child could resolve outside the root; check just those.
             let maybe_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
-            if maybe_symlink && !within_root(root.path(), &path) {
+            if maybe_symlink && !within_root(served.root.path(), &path) {
                 return None;
             }
             let meta = fs::metadata(&path).ok()?; // follows the symlink to its target
@@ -227,7 +222,7 @@ pub fn handle<S: Write + AsRawFd>(
     // passing the universal acceptability test. Any rejection is a 404 that
     // reveals nothing about why (missing, hidden, escaping, or unreadable).
     let decoded = util::percent_decode(&req.path);
-    let Some(target) = SafePath::accept(&served.root, served.exposes, &decoded) else {
+    let Some(target) = SafePath::accept(served, &decoded) else {
         return http::write_status(stream, 404);
     };
 
@@ -595,7 +590,7 @@ fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) 
              <td></td><td></td></tr>",
         );
     }
-    for child in target.children(&served.root, served.exposes) {
+    for child in target.children(served) {
         let name = child.name();
         let is_dir = child.is_dir();
         let suffix = if is_dir { "/" } else { "" };
@@ -658,7 +653,7 @@ fn propfind<S: Write>(
     // unreadable or hidden entry is simply absent, never a 404 stub).
     if target.is_dir() && include_children {
         let base = util::with_trailing_slash(decoded_path);
-        for child in target.children(&served.root, served.exposes) {
+        for child in target.children(served) {
             let child_path = format!("{}{}", base, child.name());
             response_xml(&mut xml, &child_path, &child);
         }
