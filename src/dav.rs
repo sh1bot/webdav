@@ -28,12 +28,10 @@ mod safe {
 
     use crate::util;
 
-    /// The serving context: the validated root (the trust anchor) and the
-    /// `--expose` overrides, bound together. Every acceptability check reads its
-    /// root and exposes from here, so the two are never passed as a loose,
-    /// possibly-mismatched pair. Its fields are private to this module, so code in
-    /// `dav` can pass a `Served` around but can neither pick it apart nor build a
-    /// rogue one with an unchecked root — the only constructor is [`Served::new`].
+    /// The serving context — validated root (trust anchor) plus `--expose`
+    /// overrides — bound together so the two are never passed as a mismatched
+    /// pair. Private fields, so `dav` can pass one around but can't build a rogue
+    /// one with an unchecked root; [`Served::new`] is the only constructor.
     pub struct Served<'a> {
         root: SafePath,
         exposes: &'a [String],
@@ -57,10 +55,7 @@ mod safe {
     /// those checks have passed; the `Metadata` stat'd during the check is
     /// carried along so callers don't stat again.
     pub struct SafePath {
-        // Owned (every constructor mints a fresh path — nothing outlives them to
-        // borrow), but boxed rather than a PathBuf: the path is fixed once the
-        // checks pass, so we don't need PathBuf's growable spare capacity.
-        path: Box<Path>,
+        path: Box<Path>, // owned but immutable once validated; no PathBuf capacity needed
         meta: fs::Metadata,
     }
 
@@ -82,10 +77,8 @@ mod safe {
                 .unwrap_or_else(|| "/".to_string())
         }
 
-        /// The trust anchor: wrap the served root. It isn't subject to the
-        /// request-relative checks (there is no request part yet) — we only
-        /// confirm it's a directory we can read. Every other `SafePath` is derived
-        /// from this one via [`accept`](Self::accept)/[`children`](Self::children).
+        /// The trust anchor: the served root skips the request-relative checks
+        /// (there's no request part yet) — just confirm it's a readable directory.
         pub fn root(dir: &Path) -> Option<SafePath> {
             let meta = fs::metadata(dir).ok()?;
             let ok = meta.is_dir() && is_readable(dir);
@@ -127,8 +120,8 @@ mod safe {
             fs::read_dir(&self.path)
                 .ok()
                 .into_iter()
-                .flatten() // ReadDir → io::Result<DirEntry>
-                .filter_map(Result::ok) // drop entries we couldn't read
+                .flatten()
+                .filter_map(Result::ok)
                 .filter_map(move |entry| SafePath::accept_child(served, entry))
         }
 
@@ -144,8 +137,7 @@ mod safe {
                 return None;
             }
             let path = entry.path();
-            // A symlink (or an entry whose type we couldn't determine) is the only
-            // way a child could resolve outside the root; check just those.
+            // Unknown type: treat as a possible symlink (the only way to escape).
             let maybe_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
             if maybe_symlink && !within_root(served.root.path(), &path) {
                 return None;
@@ -167,13 +159,10 @@ mod safe {
     /// resolve and check the prefix, which stops a symlink under the served tree
     /// from escaping.
     fn within_root(root: &Path, fs_path: &Path) -> bool {
-        if root == Path::new("/") {
-            return true;
-        }
-        match fs_path.canonicalize() {
-            Ok(real) => real.starts_with(root),
-            Err(_) => false,
-        }
+        root == Path::new("/")
+            || fs_path
+                .canonicalize()
+                .is_ok_and(|real| real.starts_with(root))
     }
 
     /// True if we can read `path` (following symlinks) as the user we now run as —
@@ -195,7 +184,6 @@ pub fn handle<S: Write + AsRawFd>(
     auth: &Auth,
     req: &Request,
 ) -> io::Result<()> {
-    // Require valid Basic credentials (if configured) before doing anything.
     if !auth.authorize(req) {
         return auth.challenge(stream);
     }
@@ -206,16 +194,7 @@ pub fn handle<S: Write + AsRawFd>(
     match req.method.as_str() {
         "OPTIONS" => return options(stream),
         "GET" | "HEAD" | "PROPFIND" => {}
-        _ => {
-            return http::write_response(
-                stream,
-                405,
-                "text/plain; charset=utf-8",
-                &[("Allow", ALLOW.to_string())],
-                b"405 Method Not Allowed\n",
-                true,
-            );
-        }
+        _ => return http::write_status(stream, 405, &[("Allow", ALLOW.to_string())]),
     }
 
     // The single gate: a request string becomes a filesystem path only by
@@ -223,14 +202,12 @@ pub fn handle<S: Write + AsRawFd>(
     // reveals nothing about why (missing, hidden, escaping, or unreadable).
     let decoded = util::percent_decode(&req.path);
     let Some(target) = SafePath::accept(served, &decoded) else {
-        return http::write_status(stream, 404);
+        return http::write_status(stream, 404, &[]);
     };
 
     match req.method.as_str() {
-        "GET" => get_or_head(stream, served, &decoded, &target, req, true),
-        "HEAD" => get_or_head(stream, served, &decoded, &target, req, false),
         "PROPFIND" => propfind(stream, served, &decoded, &target, req),
-        _ => unreachable!("method gated above"),
+        method => get_or_head(stream, served, &decoded, &target, req, method == "GET"),
     }
 }
 
@@ -258,7 +235,6 @@ fn get_or_head<S: Write + AsRawFd>(
     send_body: bool,
 ) -> io::Result<()> {
     if target.is_dir() {
-        // GET on a collection returns a simple HTML index for browsers.
         let html = directory_index_html(served, decoded_path, target);
         return http::write_response(
             stream,
@@ -275,22 +251,16 @@ fn get_or_head<S: Write + AsRawFd>(
     let modified = meta.modified().ok();
     let etag = etag_for(meta);
 
-    // Both the 304 and the 200/206 paths carry the same validators; build once.
     let mut headers = validator_headers(etag.as_deref(), modified);
-
-    // Conditional GET: If-None-Match / If-Modified-Since => 304 Not Modified.
     if not_modified(req, etag.as_deref(), modified) {
         return http::write_response(stream, 304, "", &headers, b"", false);
     }
-
-    // We honour single byte ranges; advertise that to clients.
     headers.push(("Accept-Ranges", "bytes".to_string()));
 
     let content_type = util::mime_for(target.path());
 
-    // Honour Range only when there's no If-Range or its validator still matches;
-    // otherwise serve the full entity (so a resumed download can't splice bytes
-    // from two different versions of a file).
+    // Ignore Range when If-Range is present and its validator no longer matches,
+    // so a resumed download can't splice bytes from two versions of the file.
     let spec = match req.header("range") {
         Some(r) if if_range_matches(req, etag.as_deref(), modified) => parse_byte_range(r, len),
         _ => RangeSpec::Ignore,
@@ -305,22 +275,24 @@ fn get_or_head<S: Write + AsRawFd>(
         }
         RangeSpec::Ignore => (200, 0, len),
         RangeSpec::Unsatisfiable => {
-            return http::write_response(
-                stream,
-                416,
-                "text/plain; charset=utf-8",
-                &[("Content-Range", format!("bytes */{}", len))],
-                b"416 Range Not Satisfiable\n",
-                true,
-            );
+            let cr = ("Content-Range", format!("bytes */{}", len));
+            return http::write_status(stream, 416, &[cr]);
         }
     };
-    let resp = Resp {
-        status,
-        content_type,
-        headers: &headers,
+
+    // Open before writing the header so a failure is an error response, not a
+    // truncated body; sendfile takes the offset directly, so no seek is needed.
+    let file = match fs::File::open(target.path()) {
+        Ok(f) => f,
+        Err(e) => return err_status(stream, &e),
     };
-    stream_file(stream, target, offset, count, &resp, send_body)
+    http::write_head(stream, status, content_type, &headers, count)?;
+    if send_body {
+        http::send_file(stream.as_raw_fd(), &file, offset, count)?;
+    } else {
+        stream.flush()?;
+    }
+    Ok(())
 }
 
 /// Build the `Last-Modified`/`ETag` headers shared by the 304 and 200/206 paths.
@@ -338,46 +310,8 @@ fn validator_headers(
     h
 }
 
-/// The status line + headers for a streamed file response.
-struct Resp<'a> {
-    status: u16,
-    content_type: &'a str,
-    headers: &'a [(&'a str, String)],
-}
-
-/// Stream `count` bytes of a file starting at byte `offset` as the response
-/// body, after writing the status line and headers. The body goes straight from
-/// the page cache to the socket via the kernel (see [`http::send_file`]), so
-/// large files never sit in memory.
-fn stream_file<S: Write + AsRawFd>(
-    stream: &mut S,
-    target: &SafePath,
-    offset: u64,
-    count: u64,
-    resp: &Resp,
-    send_body: bool,
-) -> io::Result<()> {
-    // Open before writing the header so a failure can still be reported as an
-    // error response rather than a truncated body. sendfile takes the offset
-    // directly, so there is no need to seek.
-    let file = match fs::File::open(target.path()) {
-        Ok(f) => f,
-        Err(e) => return err_status(stream, &e),
-    };
-
-    http::write_head(stream, resp.status, resp.content_type, resp.headers, count)?;
-    if send_body {
-        http::send_file(stream.as_raw_fd(), &file, offset, count)?;
-    } else {
-        stream.flush()?;
-    }
-    Ok(())
-}
-
-/// Map a filesystem error to an HTTP status. Permission-denied is reported as
-/// `404`, not `403`, so the response never reveals that an inaccessible path
-/// exists — matching the reveal-nothing `404` used for traversal and out-of-root
-/// paths.
+/// Map a filesystem error to a status; anything access-shaped (missing, denied,
+/// bad path) becomes a reveal-nothing `404` rather than exposing that it exists.
 fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
     let status = match e.kind() {
         // NotFound and PermissionDenied both 404 (reveal nothing). InvalidInput
@@ -388,7 +322,7 @@ fn err_status<S: Write>(stream: &mut S, e: &io::Error) -> io::Result<()> {
         }
         _ => 500,
     };
-    http::write_status(stream, status)
+    http::write_status(stream, status, &[])
 }
 
 /// A strong validator built from size and mtime, e.g. `"1f-65a3b2c0"`.
@@ -470,9 +404,8 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
     };
     let spec = spec.trim();
 
-    // We only implement single ranges; a comma means a multi-range request.
     if spec.contains(',') {
-        return RangeSpec::Ignore;
+        return RangeSpec::Ignore; // multi-range: unsupported, serve whole file
     }
 
     let Some((start_s, end_s)) = spec.split_once('-') else {
@@ -481,9 +414,8 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
     let start_s = start_s.trim();
     let end_s = end_s.trim();
 
-    // An empty file can satisfy no range.
     if len == 0 {
-        return RangeSpec::Unsatisfiable;
+        return RangeSpec::Unsatisfiable; // an empty file satisfies no range
     }
 
     if start_s.is_empty() {
@@ -530,20 +462,17 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
 /// listing, so this is pure progressive enhancement. Filenames reach the DOM
 /// only as escaped text/href, so the static script can't be injected into.
 const SORT_SCRIPT: &str = r#"<script>
-document.addEventListener('DOMContentLoaded',function(){
-  var tb=document.querySelector('tbody');if(!tb)return;
-  var up=null,items=[];
-  Array.prototype.forEach.call(tb.rows,function(r){
-    var a=r.querySelector('a');
-    if(a&&a.getAttribute('href')==='../')up=r;else items.push(r);
-  });
-  items.sort(function(x,y){
-    var ax=x.querySelector('a'),ay=y.querySelector('a');
-    var dx=ax.getAttribute('href').slice(-1)==='/'?0:1;
-    var dy=ay.getAttribute('href').slice(-1)==='/'?0:1;
-    return dx-dy||ax.textContent.localeCompare(ay.textContent,undefined,{sensitivity:'base',numeric:true});
-  });
-  tb.replaceChildren.apply(tb,(up?[up]:[]).concat(items));
+addEventListener('DOMContentLoaded', () => {
+  const tb = document.querySelector('tbody');
+  if (!tb) return;
+  const a = r => r.querySelector('a');
+  const rows = [...tb.rows];
+  const up = rows.find(r => a(r).getAttribute('href') === '../');
+  const dir = r => a(r).getAttribute('href').endsWith('/') ? 0 : 1;
+  const items = rows.filter(r => r !== up).sort((x, y) =>
+    dir(x) - dir(y) ||
+    a(x).textContent.localeCompare(a(y).textContent, undefined, {sensitivity: 'base', numeric: true}));
+  tb.replaceChildren(...(up ? [up] : []), ...items);
 });
 </script>"#;
 
@@ -559,11 +488,8 @@ fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) 
         "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
     );
-    // The path is user data, not English prose, so mark it translate="no". A
-    // browser's built-in / Google page translation then converts the labels
-    // around it ("Index of", the column headers) into the reader's language for
-    // free, without touching the path, filenames, dates or sizes. lang="en"
-    // above tells the translator the source language.
+    // translate="no" on the path/data so page-translation (lang="en") localizes
+    // only the fixed labels ("Index of", column headers), never filenames.
     let _ = write!(html, "<title translate=\"no\">Index of {title}</title>");
     html.push_str(
         "<style>body{font-family:sans-serif}td,th{text-align:left;padding:0 1.5rem 0 0}tbody th{font-weight:normal}</style>",
@@ -574,10 +500,8 @@ fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) 
         html,
         "<h1 id=\"t\">Index of <span translate=\"no\">{title}</span></h1>"
     );
-    // aria-labelledby names the table from the <h1> (no duplicate caption).
-    // scope=col on the headers plus scope=row on each name cell let a screen
-    // reader announce every value with its column *and* its filename. The data
-    // rows are translate="no": filenames/dates/sizes are data, not prose.
+    // scope + aria-labelledby: screen readers announce each value with its column
+    // and filename; tbody translate="no" keeps filenames/dates/sizes untranslated.
     html.push_str(
         "<table aria-labelledby=\"t\"><thead><tr><th scope=\"col\">Name</th>\
          <th scope=\"col\">Last modified (UTC)</th>\

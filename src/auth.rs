@@ -89,26 +89,18 @@ impl Auth {
         let decoded = String::from_utf8(base64_decode(rest.trim())?).ok()?;
         // Only split on the *first* colon: passwords may contain colons.
         let (user, pass) = decoded.split_once(':')?;
-        // `password_matches` does the same length-governed work whether or not
-        // the account exists, so a wrong password, a length mismatch, and an
-        // unknown user are not distinguishable by timing.
+        // Timing-uniform even for an unknown user; see password_matches.
         let stored = self.creds.get(user).map(String::as_bytes);
         Some(password_matches(stored, pass.as_bytes()))
     }
 
     /// Send a `401 Unauthorized` challenge prompting for Basic credentials.
     pub fn challenge<S: io::Write>(&self, stream: &mut S) -> io::Result<()> {
-        http::write_response(
-            stream,
-            401,
-            "text/plain; charset=utf-8",
-            &[(
-                "WWW-Authenticate",
-                "Basic realm=\"webdav\", charset=\"UTF-8\"".to_string(),
-            )],
-            b"401 Unauthorized\n",
-            true,
-        )
+        let h = (
+            "WWW-Authenticate",
+            "Basic realm=\"webdav\", charset=\"UTF-8\"".to_string(),
+        );
+        http::write_status(stream, 401, &[h])
     }
 }
 

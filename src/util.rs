@@ -1,7 +1,6 @@
 //! Small self-contained helpers: percent-coding, HTTP dates, MIME guessing,
 //! XML escaping and safe path resolution. Kept dependency-free on purpose.
 
-use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,8 +31,8 @@ pub fn percent_decode(input: &str) -> String {
             }
         }
     }
-    // The overwhelmingly common case is valid UTF-8, where this is a move with
-    // no copy; only a malformed sequence pays for the lossy-replacement path.
+    // Valid UTF-8 (the common case) moves without copying; malformed input
+    // falls back to lossy replacement.
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
@@ -80,7 +79,6 @@ pub fn resolve_within(root: &Path, request_path: &str) -> Option<PathBuf> {
             Component::Normal(seg) => resolved.push(seg),
             Component::RootDir | Component::Prefix(_) => { /* ignore leading slash */ }
             Component::CurDir => {}
-            // Any `..` is rejected outright — no climbing above the root.
             Component::ParentDir => return None,
         }
     }
@@ -155,17 +153,16 @@ pub fn with_trailing_slash(path: &str) -> String {
     }
 }
 
-/// Very small extension -> MIME type table. Falls back to octet-stream.
+/// Very small extension -> MIME type table. Falls back to octet-stream. The
+/// audio set covers a typical music library; anything unlisted downloads (or
+/// plays via the client's own type sniffing) rather than streaming in-browser.
 pub fn mime_for(path: &Path) -> &'static str {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    // Extensions are already lowercase in the overwhelming common case; only
-    // allocate a folded copy when one actually needs it.
-    let ext: Cow<str> = if ext.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(ext.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(ext)
-    };
-    match ext.as_ref() {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "txt" | "text" | "md" => "text/plain; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -180,43 +177,17 @@ pub fn mime_for(path: &Path) -> &'static str {
         "svg" => "image/svg+xml",
         "webp" => "image/webp",
         "ico" => "image/x-icon",
-        // Audio — common first, then progressively more esoteric.
         "mp3" | "mp2" | "mpga" => "audio/mpeg",
         "m4a" | "m4b" => "audio/mp4",
         "aac" => "audio/aac",
         "flac" => "audio/flac",
         "ogg" | "oga" => "audio/ogg",
         "opus" => "audio/opus",
-        "spx" => "audio/ogg", // Speex, Ogg-encapsulated
         "wav" => "audio/wav",
         "weba" => "audio/webm",
         "aif" | "aiff" | "aifc" => "audio/aiff",
         "mid" | "midi" | "kar" => "audio/midi",
         "wma" => "audio/x-ms-wma",
-        "wax" => "audio/x-ms-wax",
-        "ra" | "ram" => "audio/x-pn-realaudio",
-        "au" | "snd" => "audio/basic",
-        "amr" => "audio/amr",
-        "awb" => "audio/amr-wb",
-        "3ga" => "audio/3gpp",
-        "caf" => "audio/x-caf",
-        "ape" => "audio/x-ape",
-        "wv" => "audio/x-wavpack",
-        "tta" => "audio/x-tta",
-        "mpc" => "audio/x-musepack",
-        "mka" => "audio/x-matroska",
-        "dsf" => "audio/x-dsf",
-        "dff" => "audio/x-dff",
-        "dts" => "audio/vnd.dts",
-        "dtshd" => "audio/vnd.dts.hd",
-        "ac3" => "audio/ac3",
-        "eac3" => "audio/eac3",
-        "gsm" => "audio/x-gsm",
-        "voc" => "audio/x-voc",
-        "mod" => "audio/x-mod",
-        "s3m" => "audio/x-s3m",
-        "xm" => "audio/x-xm",
-        "it" => "audio/x-it",
         "m3u" => "audio/x-mpegurl",
         "m3u8" => "application/vnd.apple.mpegurl",
         "pls" => "audio/x-scpls",

@@ -133,13 +133,11 @@ fn parse_args() -> Args {
     a
 }
 
-/// Parse credentials. `auth_file` is the *already-open* `--auth-file` (opened
-/// before the chroot/privilege drop); parsing it happens here, after the drop, so
-/// the bug-prone work runs unprivileged. The path string is only for error text.
+/// Parse credentials from the pre-opened `--auth-file` (opened before the drop,
+/// parsed here after it — see the open site) and the inline `--auth` pairs.
 fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
     let mut auth = Auth::new();
-    // Both come from `args.auth_file`, so they're Some together; the path is
-    // only for error labels.
+    // file and path are Some together (both from args.auth_file); path is for errors.
     if let (Some(file), Some(path)) = (auth_file, &args.auth_file) {
         auth.load(file, &path.display().to_string())?;
     }
@@ -151,16 +149,15 @@ fn build_auth(args: &Args, auth_file: Option<File>) -> io::Result<Auth> {
     Ok(auth)
 }
 
-/// Everything the serve loop needs, bundled so `serve_stdin`/`serve_listener`
-/// take one reference instead of a long parameter list.
+/// Everything the serve loop needs, built once after the privilege drop and
+/// shared by reference with the serve loop and every forked child.
 struct ServeConfig<'a> {
-    root: &'a Path,
+    served: dav::Served<'a>,
     auth: &'a Auth,
     timeout: u64,
     max_requests: u32,
     max_connections: u32,
     verbose: bool,
-    exposes: &'a [String],
 }
 
 /// Serve the connection stunnel/inetd handed us. Per the inetd contract we read
@@ -178,35 +175,22 @@ fn serve_stdin(cfg: &ServeConfig) {
     let input = unsafe { File::from_raw_fd(0) };
     let mut output = unsafe { File::from_raw_fd(1) };
 
-    // Bound how long a single read/write — including the wait for the next
-    // keep-alive request — may block. Best-effort: ignored on non-sockets.
+    // Bound each read/write — including the wait for the next keep-alive request.
+    // Best-effort: ignored on non-sockets.
     if cfg.timeout != 0 {
         set_socket_timeouts(cfg.timeout);
     }
 
-    // Validate the served root here — deliberately after `lower_privileges` has
-    // chrooted and dropped to the unprivileged user. Two ordering constraints
-    // ride on this: the chroot fixes what `cfg.root` (`/`) resolves to, and the
-    // readability check (`access(2)`, real-uid) must reflect the dropped user —
-    // as root it would pass via DAC override and mislead a later GET. So this
-    // must not be hoisted ahead of the privilege drop.
-    let Some(served_root) = dav::Served::new(cfg.root, cfg.exposes) else {
-        eprintln!("cannot serve: --root is not a readable directory");
-        return;
-    };
-
-    // BufReader gives us cheap byte-at-a-time header parsing (one syscall per
-    // bufferful) and holds any bytes already read past one request for the next.
+    // BufReader retains bytes read past this request for the next one.
     let mut reader = BufReader::new(input);
     let mut served: u32 = 0;
-    // EOF, a read timeout, or a malformed line ends the connection.
     while let Ok(req) = http::read_request(&mut reader) {
         served += 1;
         let keep = req.keep_alive() && (cfg.max_requests == 0 || served < cfg.max_requests);
         http::set_keep_alive(keep);
 
         let result =
-            dav::handle(&mut output, &served_root, cfg.auth, &req).and_then(|()| output.flush());
+            dav::handle(&mut output, &cfg.served, cfg.auth, &req).and_then(|()| output.flush());
         if cfg.verbose {
             log_request(&req, http::last_status());
         }
@@ -218,12 +202,6 @@ fn serve_stdin(cfg: &ServeConfig) {
             break;
         }
     }
-}
-
-#[cfg(not(unix))]
-fn serve_stdin(_cfg: &ServeConfig) {
-    eprintln!("error: tiny-webdav is only supported on Unix platforms");
-    process::exit(1);
 }
 
 /// One-line request log for `--verbose`: method, path, response status, and any
@@ -252,18 +230,12 @@ fn log_request(req: &http::Request, status: u16) {
 }
 
 /// Create the Unix-domain socket at `path`, `listen()` on it, and return the
-/// listener. A stale socket left by a previous run is removed first; a *non*-socket
-/// at the path is refused rather than clobbered. The socket is created with
-/// permission `mode` by constraining the umask across `bind()`, so there is no
-/// window where it exists more permissively than intended. If `owner` is given
-/// (only possible as root, before the privilege drop) the socket's *owner* is
-/// set to that uid so an unrelated front-end user (e.g. cloudflared) can connect
-/// via the owner permission bits; the group is deliberately left unchanged
-/// (`root`, since we bound as root). Handing the front-end the *owner* is all it
-/// needs — the group grant in the default `660` mode then only reaches `root`,
-/// rather than re-exposing the socket to whatever group the front-end user
-/// happens to belong to. The pre-chown window is `root`-owned, so re-resolving
-/// the path here exposes nothing an unprivileged process could reach.
+/// listener. A stale socket from a previous run is removed first; a *non*-socket
+/// at the path is refused rather than clobbered. `mode` is applied by pinning the
+/// umask across `bind()`, so it never exists more permissively than intended. If
+/// `owner` is given (root only, pre-drop) the socket is chowned to that uid so a
+/// front-end like cloudflared can connect — see the inline note for why the owner
+/// and not the group.
 #[cfg(unix)]
 fn bind_listener(
     path: &str,
@@ -298,9 +270,9 @@ fn bind_listener(
         // Must chown the *pathname*, not the fd: fchown on a bound Unix-socket fd
         // targets its anonymous sockfs inode and silently no-ops the directory
         // entry (returns 0, leaves it root-owned). The pre-chown window is
-        // root-owned, so re-resolving the path here exposes nothing unprivileged.
-        // Pass gid -1 to leave the group unchanged (see the doc comment): only the
-        // owner is handed over.
+        // root-owned, so re-resolving the path exposes nothing unprivileged. gid
+        // -1 leaves the group as root: handing over the owner is all the front-end
+        // needs, and avoids re-exposing the socket to its group under mode 660.
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
         let c_path = CString::new(std::path::Path::new(path).as_os_str().as_bytes())
@@ -465,9 +437,8 @@ fn main() {
     // while we're still root. The bound socket survives the chroot untouched.
     #[cfg(unix)]
     let listener = args.listen.as_ref().map(|path| {
-        // Resolve --socket-owner while /etc/passwd is still reachable (before the
-        // chroot) and we're still root (the only case chown can succeed). Only the
-        // uid is used — the group is left as root (see bind_listener).
+        // Resolve --socket-owner before the chroot (needs /etc/passwd) and while
+        // root. Only the uid is used; the group stays root (see bind_listener).
         let owner = args.socket_owner.as_deref().map(|u| lookup_user(u).0);
         bind_listener(path, args.socket_mode, owner)
             .unwrap_or_else(|e| fatal(&format!("cannot listen on {}: {}", path, e)))
@@ -511,19 +482,23 @@ fn main() {
         }
     }
 
+    // Validate the served root now — after lower_privileges has chrooted and
+    // dropped privileges. Both matter: the chroot fixes what `serve_root` (`/`)
+    // means, and the readability check (access(2), real uid) must reflect the
+    // dropped user, not root, which bypasses it via DAC. Built once; forked
+    // children inherit it.
+    let served = dav::Served::new(&serve_root, &args.exposes)
+        .unwrap_or_else(|| fatal("--root is not a readable directory"));
     let cfg = ServeConfig {
-        root: &serve_root,
+        served,
         auth: &auth,
         timeout: args.timeout,
         max_requests: args.max_requests,
         max_connections: args.max_connections,
         verbose: args.verbose,
-        exposes: &args.exposes,
     };
-    // With a listener, the parent loops forever in serve_listener, accepting and
-    // forking; each child returns from it (its connection now on fd 0/1) and falls
-    // through to serve_stdin below — the same loop the inetd path runs. With no
-    // listener we drop straight into serve_stdin on the inherited stdin/stdout.
+    // Listener parent loops forever in serve_listener; each forked child returns
+    // and falls through to serve_stdin (the inetd path calls it directly).
     #[cfg(unix)]
     if let Some(l) = listener {
         serve_listener(l, &cfg);
@@ -561,10 +536,8 @@ fn deny_rlimit(resource: libc::c_int) {
 /// (`run_as`, default `nobody`), whose ids are resolved *before* the chroot while
 /// `/etc/passwd` is reachable. Any failure while root is fatal.
 ///
-/// Finally, if `--run-as` was given explicitly, *assert* we actually ended up as
-/// that user — this catches the case where we couldn't change uid (not root) and
-/// weren't already running as it. Returns the path to serve from: `/` once
-/// chrooted, else `root` unchanged.
+/// Asserts the outcome (see the inline checks) and returns the path to serve
+/// from: `/` once chrooted, else `root` unchanged.
 #[cfg(unix)]
 fn lower_privileges(root: &Path, run_as: Option<&str>, may_fork: bool) -> PathBuf {
     use std::ffi::CString;
@@ -661,11 +634,6 @@ fn lower_privileges(root: &Path, run_as: Option<&str>, may_fork: bool) -> PathBu
     }
 
     serve_root
-}
-
-#[cfg(not(unix))]
-fn lower_privileges(root: &Path, _run_as: Option<&str>, _may_fork: bool) -> PathBuf {
-    root.to_path_buf()
 }
 
 /// Resolve a user name to its (uid, primary gid) via `getpwnam`. Fatal if the

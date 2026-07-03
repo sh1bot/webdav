@@ -292,13 +292,17 @@ pub fn send_file(
 }
 
 /// Convenience for short text/error responses.
-pub fn write_status<S: Write>(stream: &mut S, status: u16) -> io::Result<()> {
+pub fn write_status<S: Write>(
+    stream: &mut S,
+    status: u16,
+    extra_headers: &[(&str, String)],
+) -> io::Result<()> {
     let body = format!("{} {}\n", status, reason_phrase(status));
     write_response(
         stream,
         status,
         "text/plain; charset=utf-8",
-        &[],
+        extra_headers,
         body.as_bytes(),
         true,
     )
