@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::Auth;
@@ -23,6 +23,111 @@ pub struct Served<'a> {
     pub exposes: &'a [String],
 }
 
+/// A filesystem path that has passed the one universal acceptability test:
+/// it resolves inside the served root (no `..` and no symlink escape), no
+/// component is a hidden system name (unless `--expose`d), and its target is
+/// readable by us. A `SafePath` can *only* be produced by [`Served::accept`] or
+/// [`Served::children`], so a request string can never reach the filesystem
+/// without passing the test, and holding one means the checks are already done —
+/// nothing downstream re-validates. The `Metadata` stat'd during the check is
+/// carried along so callers don't stat again.
+pub struct SafePath {
+    path: PathBuf,
+    meta: fs::Metadata,
+}
+
+impl SafePath {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+    fn meta(&self) -> &fs::Metadata {
+        &self.meta
+    }
+    fn is_dir(&self) -> bool {
+        self.meta.is_dir()
+    }
+    /// The leaf name, lossily decoded, for hrefs and display.
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string())
+    }
+}
+
+impl Served<'_> {
+    /// The universal acceptability test: turn a decoded request path into a
+    /// [`SafePath`], or `None` (⇒ a reveal-nothing 404) if it escapes the root
+    /// via `..`, names a hidden component, resolves through a symlink to outside
+    /// the root, or isn't readable by us. This is the ONE place a request string
+    /// becomes a filesystem path.
+    fn accept(&self, request_path: &str) -> Option<SafePath> {
+        // String-level checks first: reject `..`/absolute escapes, then any
+        // hidden component anywhere in the request path.
+        let path = util::resolve_within(self.root, request_path)?;
+        if util::path_has_hidden(request_path, self.exposes) {
+            return None;
+        }
+        // Filesystem-level checks: it must exist and stat, resolve (through any
+        // symlinks) inside the root, and be readable.
+        let meta = fs::metadata(&path).ok()?;
+        if !within_root(self.root, &path) || !is_readable(&path) {
+            return None;
+        }
+        Some(SafePath { path, meta })
+    }
+
+    /// Iterate the acceptable children of an already-trusted directory,
+    /// streamwise — no `Vec` of entries is built. Because `dir` is a `SafePath`
+    /// (its whole ancestry is validated by type), each entry is judged on its
+    /// *leaf* alone, without re-parsing the parent chain: see [`accept_child`].
+    fn children<'s>(&'s self, dir: &SafePath) -> impl Iterator<Item = SafePath> + 's {
+        fs::read_dir(&dir.path)
+            .ok()
+            .into_iter()
+            .flatten() // ReadDir → io::Result<DirEntry>
+            .filter_map(Result::ok) // drop entries we couldn't read
+            .filter_map(move |entry| self.accept_child(entry))
+    }
+
+    /// Accept one child of a trusted directory by its leaf only. The parent is
+    /// already known to sit inside the root, so a *non-symlink* child is inside
+    /// the root by construction (a single normal component can't climb out) —
+    /// only a symlink can point elsewhere, so we pay for the escape check
+    /// (`within_root`'s `canonicalize`) solely in that case. Hidden and
+    /// readability are judged on this entry alone.
+    fn accept_child(&self, entry: fs::DirEntry) -> Option<SafePath> {
+        let name = entry.file_name();
+        if util::is_hidden(&name.to_string_lossy(), self.exposes) {
+            return None;
+        }
+        let path = entry.path();
+        // A symlink (or an entry whose type we couldn't determine) is the only
+        // way a child could resolve outside the root; check just those.
+        let maybe_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+        if maybe_symlink && !within_root(self.root, &path) {
+            return None;
+        }
+        let meta = fs::metadata(&path).ok()?; // follows the symlink to its target
+        if !is_readable(&path) {
+            return None;
+        }
+        Some(SafePath { path, meta })
+    }
+}
+
+/// True if we can read `path` (following symlinks) as the user we now run as —
+/// the same permission `File::open` needs, so the listing never advertises a
+/// file a GET would then 404. `access(2)` uses the real uid, which equals our
+/// effective uid after the privilege drop.
+fn is_readable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => (unsafe { libc::access(c.as_ptr(), libc::R_OK) }) == 0,
+        Err(_) => false, // interior NUL: not a real path
+    }
+}
+
 pub fn handle<S: Write + AsRawFd>(
     stream: &mut S,
     served: &Served,
@@ -34,36 +139,37 @@ pub fn handle<S: Write + AsRawFd>(
         return auth.challenge(stream);
     }
 
-    // Percent-decode and sanitise the request path before touching disk. A `..`
-    // escape is reported as 404 (not 403), like an out-of-root symlink, so the
-    // response never reveals that the traversal filter (or a chroot) is in play.
+    // OPTIONS describes the server, not a resource, so it needs no path at all —
+    // answer it without touching the filesystem. Reject unsupported methods here
+    // too, before any path work.
+    match req.method.as_str() {
+        "OPTIONS" => return options(stream),
+        "GET" | "HEAD" | "PROPFIND" => {}
+        _ => {
+            return http::write_response(
+                stream,
+                405,
+                "text/plain; charset=utf-8",
+                &[("Allow", ALLOW.to_string())],
+                b"405 Method Not Allowed\n",
+                true,
+            );
+        }
+    }
+
+    // The single gate: a request string becomes a filesystem path only by
+    // passing the universal acceptability test. Any rejection is a 404 that
+    // reveals nothing about why (missing, hidden, escaping, or unreadable).
     let decoded = util::percent_decode(&req.path);
-    let Some(fs_path) = util::resolve_within(served.root, &decoded) else {
+    let Some(target) = served.accept(&decoded) else {
         return http::write_status(stream, 404);
     };
 
-    // Hidden system entries (.htpasswd, .git, @eaDir, …) are never served unless
-    // re-exposed by an `--expose` glob: a request naming a still-hidden one is
-    // refused with the same reveal-nothing 404, consistent with its omission from
-    // the listings below.
-    if util::path_has_hidden(&decoded, served.exposes) {
-        return http::write_status(stream, 404);
-    }
-
     match req.method.as_str() {
-        "OPTIONS" => options(stream),
-        "GET" => get_or_head(stream, served, &decoded, &fs_path, req, true),
-        "HEAD" => get_or_head(stream, served, &decoded, &fs_path, req, false),
-        "PROPFIND" => propfind(stream, served, &decoded, &fs_path, req),
-        // Read-only: reject every mutating / unsupported method.
-        _ => http::write_response(
-            stream,
-            405,
-            "text/plain; charset=utf-8",
-            &[("Allow", ALLOW.to_string())],
-            b"405 Method Not Allowed\n",
-            true,
-        ),
+        "GET" => get_or_head(stream, served, &decoded, &target, req, true),
+        "HEAD" => get_or_head(stream, served, &decoded, &target, req, false),
+        "PROPFIND" => propfind(stream, served, &decoded, &target, req),
+        _ => unreachable!("method gated above"),
     }
 }
 
@@ -86,17 +192,13 @@ fn get_or_head<S: Write + AsRawFd>(
     stream: &mut S,
     served: &Served,
     decoded_path: &str,
-    fs_path: &Path,
+    target: &SafePath,
     req: &Request,
     send_body: bool,
 ) -> io::Result<()> {
-    let Some(meta) = stat_within_root(stream, served.root, fs_path)? else {
-        return Ok(());
-    };
-
-    if meta.is_dir() {
+    if target.is_dir() {
         // GET on a collection returns a simple HTML index for browsers.
-        let html = directory_index_html(served, decoded_path, fs_path);
+        let html = directory_index_html(served, decoded_path, target);
         return http::write_response(
             stream,
             200,
@@ -107,9 +209,10 @@ fn get_or_head<S: Write + AsRawFd>(
         );
     }
 
+    let meta = target.meta();
     let len = meta.len();
     let modified = meta.modified().ok();
-    let etag = etag_for(&meta);
+    let etag = etag_for(meta);
 
     // Both the 304 and the 200/206 paths carry the same validators; build once.
     let mut headers = validator_headers(etag.as_deref(), modified);
@@ -122,7 +225,7 @@ fn get_or_head<S: Write + AsRawFd>(
     // We honour single byte ranges; advertise that to clients.
     headers.push(("Accept-Ranges", "bytes".to_string()));
 
-    let content_type = util::mime_for(fs_path);
+    let content_type = util::mime_for(target.path());
 
     // Honour Range only when there's no If-Range or its validator still matches;
     // otherwise serve the full entity (so a resumed download can't splice bytes
@@ -156,7 +259,7 @@ fn get_or_head<S: Write + AsRawFd>(
         content_type,
         headers: &headers,
     };
-    stream_file(stream, fs_path, offset, count, &resp, send_body)
+    stream_file(stream, target.path(), offset, count, &resp, send_body)
 }
 
 /// Build the `Last-Modified`/`ETag` headers shared by the 304 and 200/206 paths.
@@ -208,25 +311,6 @@ fn stream_file<S: Write + AsRawFd>(
         stream.flush()?;
     }
     Ok(())
-}
-
-/// `stat` the target and confine it to `root` in one place, so every handler
-/// applies the same gate. On success returns the metadata; on any failure writes
-/// the response (404/403/500, with an out-of-root target mapped to 404 so the
-/// chroot status isn't revealed) and returns `None`.
-fn stat_within_root<S: Write>(
-    stream: &mut S,
-    root: &Path,
-    fs_path: &Path,
-) -> io::Result<Option<fs::Metadata>> {
-    let meta = match fs::metadata(fs_path) {
-        Ok(m) => m,
-        Err(e) => return err_status(stream, &e).map(|()| None),
-    };
-    if !within_root(root, fs_path) {
-        return http::write_status(stream, 404).map(|()| None);
-    }
-    Ok(Some(meta))
 }
 
 /// Map a filesystem error to an HTTP status. Permission-denied is reported as
@@ -392,49 +476,10 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
     RangeSpec::Satisfiable { start, end }
 }
 
-struct IndexEntry {
-    name: String,
-    is_dir: bool,
-    /// Last-modified time, if the filesystem reports one.
-    modified: Option<SystemTime>,
-    /// Size in bytes (meaningful for files only).
-    len: u64,
-}
-
-/// List `fs_path`'s children that aren't hidden (per `served.exposes`) and
-/// don't resolve outside `served.root` (an escaping symlink). Shared by the
-/// HTML index and PROPFIND.
-fn visible_children(served: &Served, fs_path: &Path) -> Vec<fs::DirEntry> {
-    let Ok(rd) = fs::read_dir(fs_path) else {
-        return Vec::new();
-    };
-    rd.flatten()
-        .filter(|e| !util::is_hidden(&e.file_name().to_string_lossy(), served.exposes))
-        .filter(|e| within_root(served.root, &e.path()))
-        .collect()
-}
-
-fn directory_index_html(served: &Served, decoded_path: &str, fs_path: &Path) -> String {
-    let mut entries: Vec<IndexEntry> = Vec::new();
-    for e in visible_children(served, fs_path) {
-        // Follow symlinks so size/date match what GET would actually serve.
-        // Fall back to the entry's own type if the target can't be stat'd.
-        let md = fs::metadata(e.path()).ok();
-        let is_dir = md
-            .as_ref()
-            .map(|m| m.is_dir())
-            .or_else(|| e.file_type().map(|t| t.is_dir()).ok())
-            .unwrap_or(false);
-        entries.push(IndexEntry {
-            name: e.file_name().to_string_lossy().into_owned(),
-            is_dir,
-            modified: md.as_ref().and_then(|m| m.modified().ok()),
-            len: md.as_ref().map(|m| m.len()).unwrap_or(0),
-        });
-    }
-    // Directories first, then alphabetical.
-    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
-
+/// Render the HTML directory index, streaming entries straight from
+/// [`Served::children`] into the output (filesystem order, no intermediate list
+/// and no sort).
+fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) -> String {
     let base = util::with_trailing_slash(decoded_path);
     let title = util::xml_escape(decoded_path);
 
@@ -454,22 +499,26 @@ fn directory_index_html(served: &Served, decoded_path: &str, fs_path: &Path) -> 
     if decoded_path != "/" {
         html.push_str("<tr><td><a href=\"../\">../</a></td><td></td><td></td></tr>");
     }
-    for e in entries {
-        let suffix = if e.is_dir { "/" } else { "" };
-        let href = util::percent_encode_path(&format!("{}{}{}", base, e.name, suffix));
-        let modified = e
-            .modified
+    for child in served.children(target) {
+        let name = child.name();
+        let is_dir = child.is_dir();
+        let suffix = if is_dir { "/" } else { "" };
+        let href = util::percent_encode_path(&format!("{}{}{}", base, name, suffix));
+        let modified = child
+            .meta()
+            .modified()
+            .ok()
             .map(util::datetime_utc)
             .unwrap_or_else(|| "-".to_string());
-        let size = if e.is_dir {
+        let size = if is_dir {
             "-".to_string()
         } else {
-            util::human_size(e.len)
+            util::human_size(child.meta().len())
         };
         let _ = write!(
             html,
             "<tr><td><a href=\"{href}\">{}{suffix}</a></td><td>{modified}</td><td>{size}</td></tr>",
-            util::xml_escape(&e.name),
+            util::xml_escape(&name),
         );
     }
     html.push_str("</tbody></table></body></html>");
@@ -480,13 +529,9 @@ fn propfind<S: Write>(
     stream: &mut S,
     served: &Served,
     decoded_path: &str,
-    fs_path: &Path,
+    target: &SafePath,
     req: &Request,
 ) -> io::Result<()> {
-    let Some(meta) = stat_within_root(stream, served.root, fs_path)? else {
-        return Ok(());
-    };
-
     // Depth: 0 => just this resource; 1 => this resource + immediate children.
     let depth = req.header("depth").unwrap_or("1").trim();
     // We don't crawl recursively; tell an "infinity" client to walk per-level
@@ -510,21 +555,16 @@ fn propfind<S: Write>(
     xml.push_str("<D:multistatus xmlns:D=\"DAV:\">\n");
 
     // The resource itself.
-    response_xml(&mut xml, decoded_path, &meta, fs_path);
+    response_xml(&mut xml, decoded_path, target);
 
-    // Immediate children, if this is a collection and depth allows it.
-    if meta.is_dir() && include_children {
+    // Immediate children, if this is a collection and depth allows it — streamed
+    // straight from `children` (already filtered to the acceptable set, so an
+    // unreadable or hidden entry is simply absent, never a 404 stub).
+    if target.is_dir() && include_children {
         let base = util::with_trailing_slash(decoded_path);
-        for entry in visible_children(served, fs_path) {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let child_path = format!("{}{}", base, name);
-            // Follow symlinks (matching GET); list un-stattable entries with
-            // a 404 propstat rather than dropping them from the listing.
-            match fs::metadata(&path) {
-                Ok(child_meta) => response_xml(&mut xml, &child_path, &child_meta, &path),
-                Err(_) => response_failed_xml(&mut xml, &child_path),
-            }
+        for child in served.children(target) {
+            let child_path = format!("{}{}", base, child.name());
+            response_xml(&mut xml, &child_path, &child);
         }
     }
 
@@ -542,7 +582,8 @@ fn propfind<S: Write>(
 
 /// Append one `<D:response>` block describing a single resource to `out`
 /// (written in place, so a Depth: 1 listing doesn't allocate a String per child).
-fn response_xml(out: &mut String, href_path: &str, meta: &fs::Metadata, fs_path: &Path) {
+fn response_xml(out: &mut String, href_path: &str, target: &SafePath) {
+    let meta = target.meta();
     let is_dir = meta.is_dir();
 
     // Collections must end with a trailing slash in their href.
@@ -552,11 +593,7 @@ fn response_xml(out: &mut String, href_path: &str, meta: &fs::Metadata, fs_path:
         href_path.to_string()
     };
     let href = util::percent_encode_path(&href);
-
-    let display = fs_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".to_string());
+    let display = target.name();
 
     let modified = meta
         .modified()
@@ -577,7 +614,7 @@ fn response_xml(out: &mut String, href_path: &str, meta: &fs::Metadata, fs_path:
             "        <D:resourcetype/>\n        <D:getcontentlength>{}</D:getcontentlength>\n        \
              <D:getcontenttype>{}</D:getcontenttype>\n",
             meta.len(),
-            util::mime_for(fs_path),
+            util::mime_for(target.path()),
         );
         // Same strong validator GET sends as ETag; the value has no XML specials.
         if let Some(etag) = etag_for(meta) {
@@ -585,15 +622,4 @@ fn response_xml(out: &mut String, href_path: &str, meta: &fs::Metadata, fs_path:
         }
     }
     out.push_str("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n  </D:response>\n");
-}
-
-/// Append a `<D:response>` for an entry whose metadata couldn't be read: list
-/// the href with a 404 status so the client sees a complete (if partial) listing.
-fn response_failed_xml(out: &mut String, href_path: &str) {
-    let _ = write!(
-        out,
-        "  <D:response>\n    <D:href>{}</D:href>\n    \
-         <D:status>HTTP/1.1 404 Not Found</D:status>\n  </D:response>\n",
-        util::percent_encode_path(href_path)
-    );
 }
