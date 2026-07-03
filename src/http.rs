@@ -4,10 +4,10 @@
 //! [`write_head`] emits the matching `Connection` header. Every response carries
 //! a `Content-Length`, so each one is self-delimiting on a kept-alive connection.
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering::Relaxed};
 use std::time::SystemTime;
 
 use crate::util;
@@ -34,31 +34,29 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-thread_local! {
-    /// Whether the response now being written should keep the connection open;
-    /// set per request by the serve loop, read by `write_head`. One
-    /// single-threaded process per connection, so a thread-local acts as a
-    /// per-connection flag without threading it through every response helper.
-    static KEEP_ALIVE: Cell<bool> = const { Cell::new(false) };
-}
+// The process serves one connection at a time in a single thread (a fork per
+// connection under `--listen`, or one inetd invocation), so these two are just
+// process-global mutable state — an atomic static is the safe way to hold that
+// in Rust without `unsafe` on a `static mut`. `Relaxed` because there is no
+// second thread to order against. They spare us threading a keep-alive flag and
+// a status code through every response helper and handler return.
+
+/// Whether the response now being written should keep the connection open; set
+/// per request by the serve loop, read by `write_head`.
+static KEEP_ALIVE: AtomicBool = AtomicBool::new(false);
+
+/// Status of the most recent response, recorded by `write_head` (the choke point
+/// every response passes through). Read by the serve loop for `--verbose` logging.
+static LAST_STATUS: AtomicU16 = AtomicU16::new(0);
 
 /// Set the connection disposition for subsequent responses (see [`write_head`]).
 pub fn set_keep_alive(v: bool) {
-    KEEP_ALIVE.with(|k| k.set(v));
-}
-
-thread_local! {
-    /// Status of the most recent response, recorded by `write_head` (the single
-    /// choke point every response passes through). Read by the serve loop for
-    /// `--verbose` request logging, so the status needn't be plumbed back through
-    /// every handler return. Same single-threaded, one-connection rationale as
-    /// `KEEP_ALIVE`.
-    static LAST_STATUS: Cell<u16> = const { Cell::new(0) };
+    KEEP_ALIVE.store(v, Relaxed);
 }
 
 /// The status code of the response most recently written (see [`write_head`]).
 pub fn last_status() -> u16 {
-    LAST_STATUS.with(|s| s.get())
+    LAST_STATUS.load(Relaxed)
 }
 
 pub struct Request {
@@ -223,7 +221,7 @@ pub fn write_head<S: Write>(
     extra_headers: &[(&str, String)],
     content_length: u64,
 ) -> io::Result<()> {
-    LAST_STATUS.with(|s| s.set(status));
+    LAST_STATUS.store(status, Relaxed);
     let mut head = String::new();
     let _ = write!(head, "HTTP/1.1 {} {}\r\n", status, reason_phrase(status));
     let _ = write!(head, "Content-Length: {}\r\n", content_length);
@@ -235,7 +233,7 @@ pub fn write_head<S: Write>(
     }
     let _ = write!(head, "Date: {}\r\n", util::http_date(SystemTime::now()));
     head.push_str("Server: tiny-webdav\r\n");
-    let alive = KEEP_ALIVE.with(|k| k.get());
+    let alive = KEEP_ALIVE.load(Relaxed);
     head.push_str(if alive {
         "Connection: keep-alive\r\n"
     } else {
