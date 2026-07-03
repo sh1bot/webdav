@@ -476,9 +476,33 @@ fn parse_byte_range(value: &str, len: u64) -> RangeSpec {
     RangeSpec::Satisfiable { start, end }
 }
 
+/// A dependency-free client-side sorter, inlined into the index `<head>`. The
+/// server streams rows in filesystem order (no server-side buffering to sort);
+/// the browser reorders them to directories-first, then natural-alphabetical,
+/// keeping `../` pinned at the top. No-JS clients still get a usable (unsorted)
+/// listing, so this is pure progressive enhancement. Filenames reach the DOM
+/// only as escaped text/href, so the static script can't be injected into.
+const SORT_SCRIPT: &str = r#"<script>
+document.addEventListener('DOMContentLoaded',function(){
+  var tb=document.querySelector('tbody');if(!tb)return;
+  var up=null,items=[];
+  Array.prototype.forEach.call(tb.rows,function(r){
+    var a=r.querySelector('a');
+    if(a&&a.getAttribute('href')==='../')up=r;else items.push(r);
+  });
+  items.sort(function(x,y){
+    var ax=x.querySelector('a'),ay=y.querySelector('a');
+    var dx=ax.getAttribute('href').slice(-1)==='/'?0:1;
+    var dy=ay.getAttribute('href').slice(-1)==='/'?0:1;
+    return dx-dy||ax.textContent.localeCompare(ay.textContent,undefined,{sensitivity:'base',numeric:true});
+  });
+  tb.replaceChildren.apply(tb,(up?[up]:[]).concat(items));
+});
+</script>"#;
+
 /// Render the HTML directory index, streaming entries straight from
 /// [`Served::children`] into the output (filesystem order, no intermediate list
-/// and no sort).
+/// and no sort). Ordering for display is done client-side by [`SORT_SCRIPT`].
 fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) -> String {
     let base = util::with_trailing_slash(decoded_path);
     let title = util::xml_escape(decoded_path);
@@ -487,8 +511,10 @@ fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) 
     html.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
     let _ = write!(html, "<title>Index of {title}</title>");
     html.push_str(
-        "<style>body{font-family:sans-serif}td,th{text-align:left;padding:0 1.5rem 0 0}</style></head><body>",
+        "<style>body{font-family:sans-serif}td,th{text-align:left;padding:0 1.5rem 0 0}</style>",
     );
+    html.push_str(SORT_SCRIPT);
+    html.push_str("</head><body>");
     let _ = write!(html, "<h1>Index of {title}</h1>");
     html.push_str(
         "<table><thead><tr><th scope=\"col\">Name</th>\
