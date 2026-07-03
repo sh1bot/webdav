@@ -318,17 +318,16 @@ fn bind_listener(
 /// cloudflared) rather than behind stunnel. Privileges were already dropped once
 /// (before this loop), so each child inherits the chroot and unprivileged uid for
 /// free; forking the running image is copy-on-write, with no `exec`. The child
-/// moves the connection onto fd 0/1 and runs the very same serve loop as the
-/// inetd path.
+/// puts its connection on fd 0/1 and *returns*, falling through to the same
+/// `serve_stdin` loop the inetd path runs; the parent loops here forever.
 #[cfg(unix)]
-fn serve_listener(listener: std::os::unix::net::UnixListener, cfg: &ServeConfig) -> ! {
-    use std::os::unix::io::{AsRawFd, IntoRawFd};
+fn serve_listener(listener: std::os::unix::net::UnixListener, cfg: &ServeConfig) {
+    use std::os::unix::io::IntoRawFd;
 
     // We reap children ourselves (no `SIGCHLD` = `SIG_IGN`) so we can count how
     // many are in flight and cap concurrency: otherwise a connection flood forks
     // children without bound and exhausts PIDs/memory. Exited children stay
     // reapable (as zombies) until `reap_dead` collects them each loop.
-    let listen_fd = listener.as_raw_fd();
     let mut live: u32 = 0; // connections currently being served by a child
     loop {
         live = live.saturating_sub(reap_dead());
@@ -362,8 +361,10 @@ fn serve_listener(listener: std::os::unix::net::UnixListener, cfg: &ServeConfig)
             }
             0 => {
                 // Child: put the connection on fd 0 and fd 1 so the shared serve
-                // loop (reads 0, writes 1) works unchanged, release the listening
-                // socket, re-forbid forking for this process, then serve and exit.
+                // loop (reads 0, writes 1) works unchanged, re-forbid forking, then
+                // return — falling through to serve_stdin in `main`. Returning drops
+                // our copy of the listening socket, closing it; the parent keeps its
+                // own copy open.
                 let conn_fd = stream.into_raw_fd();
                 unsafe {
                     libc::dup2(conn_fd, 0);
@@ -371,11 +372,9 @@ fn serve_listener(listener: std::os::unix::net::UnixListener, cfg: &ServeConfig)
                     if conn_fd > 1 {
                         libc::close(conn_fd);
                     }
-                    libc::close(listen_fd);
                 }
                 deny_rlimit(libc::RLIMIT_NPROC as _);
-                serve_stdin(cfg);
-                process::exit(0);
+                return;
             }
             _ => live += 1, // Parent: one more child in flight.
         }
@@ -521,12 +520,14 @@ fn main() {
         verbose: args.verbose,
         exposes: &args.exposes,
     };
+    // With a listener, the parent loops forever in serve_listener, accepting and
+    // forking; each child returns from it (its connection now on fd 0/1) and falls
+    // through to serve_stdin below — the same loop the inetd path runs. With no
+    // listener we drop straight into serve_stdin on the inherited stdin/stdout.
     #[cfg(unix)]
-    match listener {
-        Some(l) => serve_listener(l, &cfg),
-        None => serve_stdin(&cfg),
+    if let Some(l) = listener {
+        serve_listener(l, &cfg);
     }
-    #[cfg(not(unix))]
     serve_stdin(&cfg);
 }
 
