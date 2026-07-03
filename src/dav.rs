@@ -508,22 +508,40 @@ fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) 
     let title = util::xml_escape(decoded_path);
 
     let mut html = String::new();
-    html.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
-    let _ = write!(html, "<title>Index of {title}</title>");
     html.push_str(
-        "<style>body{font-family:sans-serif}td,th{text-align:left;padding:0 1.5rem 0 0}</style>",
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+    );
+    // The path is user data, not English prose, so mark it translate="no". A
+    // browser's built-in / Google page translation then converts the labels
+    // around it ("Index of", the column headers) into the reader's language for
+    // free, without touching the path, filenames, dates or sizes. lang="en"
+    // above tells the translator the source language.
+    let _ = write!(html, "<title translate=\"no\">Index of {title}</title>");
+    html.push_str(
+        "<style>body{font-family:sans-serif}td,th{text-align:left;padding:0 1.5rem 0 0}tbody th{font-weight:normal}</style>",
     );
     html.push_str(SORT_SCRIPT);
     html.push_str("</head><body>");
-    let _ = write!(html, "<h1>Index of {title}</h1>");
+    let _ = write!(
+        html,
+        "<h1 id=\"t\">Index of <span translate=\"no\">{title}</span></h1>"
+    );
+    // aria-labelledby names the table from the <h1> (no duplicate caption).
+    // scope=col on the headers plus scope=row on each name cell let a screen
+    // reader announce every value with its column *and* its filename. The data
+    // rows are translate="no": filenames/dates/sizes are data, not prose.
     html.push_str(
-        "<table><thead><tr><th scope=\"col\">Name</th>\
+        "<table aria-labelledby=\"t\"><thead><tr><th scope=\"col\">Name</th>\
          <th scope=\"col\">Last modified (UTC)</th>\
-         <th scope=\"col\">Size</th></tr></thead><tbody>",
+         <th scope=\"col\">Size</th></tr></thead><tbody translate=\"no\">",
     );
 
     if decoded_path != "/" {
-        html.push_str("<tr><td><a href=\"../\">../</a></td><td></td><td></td></tr>");
+        html.push_str(
+            "<tr><th scope=\"row\"><a href=\"../\" aria-label=\"Parent directory\">../</a></th>\
+             <td></td><td></td></tr>",
+        );
     }
     for child in served.children(target) {
         let name = child.name();
@@ -543,7 +561,7 @@ fn directory_index_html(served: &Served, decoded_path: &str, target: &SafePath) 
         };
         let _ = write!(
             html,
-            "<tr><td><a href=\"{href}\">{}{suffix}</a></td><td>{modified}</td><td>{size}</td></tr>",
+            "<tr><th scope=\"row\"><a href=\"{href}\">{}{suffix}</a></th><td>{modified}</td><td>{size}</td></tr>",
             util::xml_escape(&name),
         );
     }
